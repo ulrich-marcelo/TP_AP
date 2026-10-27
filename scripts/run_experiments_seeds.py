@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import pyarrow
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]
@@ -31,21 +32,21 @@ TOP_CONFIGS = {
         "candidates": [
             {
                 "config_id": "CNN_Top1",
-                "timesteps": 7, "hidden_size": 24, "dropout_rate": 0.3,
-                "kernel_size": 3, "num_layers": 2, "learning_rate": 1e-3,
-                "weight_decay": 1e-4, "batch_size": 32
+                "timesteps": 7, "hidden_size": 32, "dropout_rate": 0.4,
+                "kernel_size": 3, "num_layers": 1, "learning_rate": 0.0025871,
+                "weight_decay": 0.000041222, "batch_size": 64,"run_name":"balmy-sweep-24"
             },
             {
                 "config_id": "CNN_Top2",
-                "timesteps": 5, "hidden_size": 32, "dropout_rate": 0.4,
-                "kernel_size": 3, "num_layers": 1, "learning_rate": 8e-4,
-                "weight_decay": 5e-4, "batch_size": 32
+                "timesteps": 7, "hidden_size": 32, "dropout_rate": 0.5,
+                "kernel_size": 3, "num_layers": 1, "learning_rate": 0.0028641,
+                "weight_decay": 0.000070175, "batch_size": 64,"run_name":"young-sweep-14"
             },
             {
                 "config_id": "CNN_Top3",
-                "timesteps": 14, "hidden_size": 24, "dropout_rate": 0.3,
-                "kernel_size": 5, "num_layers": 2, "learning_rate": 1e-3,
-                "weight_decay": 1e-3, "batch_size": 64
+                "timesteps": 7, "hidden_size": 32, "dropout_rate": 0.5,
+                "kernel_size": 5, "num_layers": 2, "learning_rate": 0.0026612,
+                "weight_decay": 0.00018786, "batch_size": 64,"run_name":"trim-sweep-39"
             }
         ]
     },
@@ -54,21 +55,21 @@ TOP_CONFIGS = {
         "candidates": [
             {
                 "config_id": "GRU_Top1",
-                "timesteps": 7, "hidden_size": 32, "dropout_rate": 0.3,
-                "num_layers": 1, "learning_rate": 1e-3, "weight_decay": 1e-4,
-                "batch_size": 32
+                "timesteps": 21, "hidden_size": 32, "dropout_rate": 0.3,
+                "num_layers": 2, "learning_rate": 0.0025469, "weight_decay": 0.0001075,
+                "batch_size": 64,"run_name":"eager-sweep-30"
             },
             {
                 "config_id": "GRU_Top2",
-                "timesteps": 5, "hidden_size": 24, "dropout_rate": 0.3,
-                "num_layers": 1, "learning_rate": 1.2e-3, "weight_decay": 1e-4,
-                "batch_size": 32
+                "timesteps": 21, "hidden_size": 32, "dropout_rate": 0.3,
+                "num_layers": 2, "learning_rate": 0.0021255, "weight_decay": 0.00010845,
+                "batch_size": 32,"run_name":"zesty-sweep-16"
             },
             {
                 "config_id": "GRU_Top3",
-                "timesteps": 14, "hidden_size": 32, "dropout_rate": 0.4,
-                "num_layers": 2, "learning_rate": 8e-4, "weight_decay": 5e-4,
-                "batch_size": 64
+                "timesteps": 21, "hidden_size": 32, "dropout_rate": 0.4,
+                "num_layers": 2, "learning_rate": 0.0025171, "weight_decay": 0.00050093,
+                "batch_size": 16,"run_name":"comfy-sweep-18"
             }
         ]
     },
@@ -77,21 +78,21 @@ TOP_CONFIGS = {
         "candidates": [
             {
                 "config_id": "LSTM_Top1",
-                "timesteps": 7, "hidden_size": 32, "dropout_rate": 0.3,
-                "num_layers": 1, "learning_rate": 1e-3, "weight_decay": 1e-4,
-                "batch_size": 32
+                "timesteps": 21, "hidden_size": 32, "dropout_rate": 0.5,
+                "num_layers": 2, "learning_rate": 0.0029159, "weight_decay": 0.000025594,
+                "batch_size": 64,"run_name":"eager-sweep-3"
             },
             {
                 "config_id": "LSTM_Top2",
-                "timesteps": 5, "hidden_size": 32, "dropout_rate": 0.4,
-                "num_layers": 1, "learning_rate": 8e-4, "weight_decay": 1e-4,
-                "batch_size": 32
+                "timesteps": 5, "hidden_size": 16, "dropout_rate": 0.2,
+                "num_layers": 2, "learning_rate": 0.0013921, "weight_decay": 0.000010607,
+                "batch_size": 32,"run_name":"rose-sweep-17"
             },
             {
                 "config_id": "LSTM_Top3",
-                "timesteps": 14, "hidden_size": 24, "dropout_rate": 0.3,
-                "num_layers": 2, "learning_rate": 6e-4, "weight_decay": 1e-3,
-                "batch_size": 64
+                "timesteps": 7, "hidden_size": 16, "dropout_rate": 0.2,
+                "num_layers": 2, "learning_rate": 0.0028714, "weight_decay": 0.000010104,
+                "batch_size": 16,"run_name":"firm-sweep-16"
             }
         ]
     }
@@ -137,11 +138,11 @@ def run_top_n_multiseed_analysis():
                     seed=seed
                 )
                 
-                seed_mean_qlike = float(df_metrics['mean_qlike'].mean())
-                seed_median_qlike = float(df_metrics['median_qlike'].mean())
-                seed_std_folds = float(df_metrics['mean_qlike'].std())
+                seed_mean_qlike = float(df_metrics['val_mean_qlike'].mean())
+                seed_median_qlike = float(df_metrics['val_median_qlike'].mean())
 
-                seed_scores[cfg_id].append(seed_mean_qlike)
+                global_mean_qlike = float(df_preds['qlike'].mean())
+                seed_scores[cfg_id].append(global_mean_qlike)
                 
                 df_preds['architecture'] = arch_name
                 df_preds['config_id'] = cfg_id
