@@ -1,4 +1,5 @@
 import copy
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -6,6 +7,18 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import RobustScaler
 from torch.utils.data import DataLoader, TensorDataset
+import wandb
+
+def set_deterministic_seed(seed=42):
+    """Garantiza reproducibilidad estricta en PyTorch, NumPy y CuDNN."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 class QLIKELoss(nn.Module):
     def __init__(self, eps=1e-6):
@@ -13,13 +26,19 @@ class QLIKELoss(nn.Module):
         self.eps = eps
 
     def forward(self, h_pred, y_true):
-        # h_pred es ln(sigma^2), la red predice la varianza en escala logarítmica
         hat_sigma2 = torch.exp(h_pred)
         hat_sigma2 = torch.clamp(hat_sigma2, min=self.eps)
         y_true = torch.clamp(y_true, min=self.eps)
         ratio = y_true / hat_sigma2
         loss = ratio - torch.log(ratio) - 1.0
         return torch.mean(loss)
+
+def create_sequences(features, target, timesteps):
+    X, y = [], []
+    for i in range(len(features) - timesteps):
+        X.append(features[i:(i + timesteps)])
+        y.append(target[i + timesteps - 1])
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(y), dtype=torch.float32)
 
 def create_sequences_with_dates(features, target, dates, timesteps):
     X, y, d = [], [], []
@@ -33,6 +52,38 @@ def create_sequences_with_dates(features, target, dates, timesteps):
         np.array(d)
     )
 
+def evaluate_model_qlike(model, data_loader, device):
+    """
+    Evalúa determinísticamente (Dropout apagado) las pérdidas QLIKE sobre un DataLoader.
+    """
+    model.eval()
+    y_list, h_list = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch = X_batch.to(device)
+            h_pred = model(X_batch).squeeze(-1)
+            h_list.extend(h_pred.cpu().numpy().tolist())
+            y_list.extend(y_batch.numpy().tolist())
+
+    y_arr = np.array(y_list)
+    h_arr = np.array(h_list)
+    sigma2_arr = np.exp(h_arr)
+
+    eps = 1e-6
+    sigma2_safe = np.clip(sigma2_arr, eps, None)
+    y_safe = np.clip(y_arr, eps, None)
+    ratio = y_safe / sigma2_safe
+    qlike = ratio - np.log(ratio) - 1.0
+
+    return {
+        'mean_qlike': float(np.mean(qlike)),
+        'median_qlike': float(np.median(qlike)),
+        'std_daily': float(np.std(qlike, ddof=1)) if len(qlike) > 1 else 0.0,
+        'qlike_arr': qlike,
+        'y_true': y_arr,
+        'sigma2_pred': sigma2_arr
+    }
+
 def train_fold(
     model, 
     train_loader, 
@@ -44,7 +95,8 @@ def train_fold(
     device,
     patience=10, 
     min_delta=1e-4, 
-    max_grad_norm=1.0
+    max_grad_norm=1.0,
+    log_to_wandb=False
 ):
     best_val_loss = float('inf')
     best_model_state = None
@@ -85,6 +137,13 @@ def train_fold(
         history['train_loss'].append(train_loss_epoch)
         history['val_loss'].append(val_loss_epoch)
 
+        if log_to_wandb and wandb.run is not None:
+            wandb.log({
+                f"fold_{fold_idx}_train_loss": train_loss_epoch,
+                f"fold_{fold_idx}_val_loss": val_loss_epoch,
+                f"fold_{fold_idx}_epoch": epoch
+            })
+
         if val_loss_epoch < best_val_loss - min_delta:
             best_val_loss = val_loss_epoch
             best_model_state = copy.deepcopy(model.state_dict())
@@ -100,38 +159,150 @@ def train_fold(
 
     return best_val_loss, history
 
-def evaluate_fold_predictions(model, val_loader, val_dates, criterion, device):
-    """
-    Computa y retorna las predicciones desescaladas y métricas individuales.
-    """
-    model.eval()
-    y_trues, h_preds = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            X_batch = X_batch.to(device)
-            h = model(X_batch).squeeze(-1)
-            h_preds.extend(h.cpu().numpy().tolist())
-            y_trues.extend(y_batch.numpy().tolist())
+def _extract_config_value(config, key, default=None):
+    if hasattr(config, key):
+        return getattr(config, key)
+    if isinstance(config, dict) and key in config:
+        return config[key]
+    return default
 
-    y_trues = np.array(y_trues)
-    h_preds = np.array(h_preds)
-    sigma2_pred = np.exp(h_preds)
-    
-    # QLIKE por día individual
-    eps = 1e-6
-    sigma2_safe = np.clip(sigma2_pred, eps, None)
-    y_safe = np.clip(y_trues, eps, None)
-    ratio = y_safe / sigma2_safe
-    pointwise_qlike = ratio - np.log(ratio) - 1.0
+def run_walk_forward_sweep(
+    model_class, 
+    X_raw, 
+    y_raw, 
+    config, 
+    epochs=45, 
+    patience=10,
+    seed=42,
+    train_window_days=1095,
+    val_window_days=182,
+    step_days=182
+):
+    set_deterministic_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    total_days = len(X_raw)
+    input_size = X_raw.shape[1]
 
-    records = pd.DataFrame({
-        'Date': val_dates,
-        'y_true': y_trues,
-        'h_pred': h_preds,
-        'sigma2_pred': sigma2_pred,
-        'qlike': pointwise_qlike
-    })
-    return records
+    timesteps = _extract_config_value(config, 'timesteps', 7)
+    batch_size = _extract_config_value(config, 'batch_size', 32)
+    hidden_size = _extract_config_value(config, 'hidden_size', 32)
+    dropout_rate = _extract_config_value(config, 'dropout_rate', 0.3)
+    learning_rate = _extract_config_value(config, 'learning_rate', 1e-3)
+    weight_decay = _extract_config_value(config, 'weight_decay', 1e-4)
+    kernel_size = _extract_config_value(config, 'kernel_size', 3)
+    num_layers = _extract_config_value(config, 'num_layers', 1)
+
+    fold_val_means = []
+    fold_val_medians = []
+    fold_train_means = []
+    fold_train_medians = []
+
+    start_idx = 0
+    fold_idx = 0
+
+    while start_idx + train_window_days < total_days:
+        train_start = start_idx
+        train_end = start_idx + train_window_days
+        val_start = train_end
+        val_end = min(val_start + val_window_days, total_days)
+
+        if (val_end - val_start) < 90:
+            break
+
+        X_train_fold = X_raw[train_start:train_end]
+        y_train_fold = y_raw[train_start:train_end]
+        X_val_fold = X_raw[val_start:val_end]
+        y_val_fold = y_raw[val_start:val_end]
+
+        scaler = RobustScaler()
+        X_train_scaled = scaler.fit_transform(X_train_fold)
+        X_val_scaled = scaler.transform(X_val_fold)
+
+        X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_fold, timesteps)
+        X_val_seq, y_val_seq = create_sequences(X_val_scaled, y_val_fold, timesteps)
+
+        train_loader = DataLoader(TensorDataset(X_train_seq, y_train_seq), batch_size=batch_size, shuffle=True)
+        train_eval_loader = DataLoader(TensorDataset(X_train_seq, y_train_seq), batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(TensorDataset(X_val_seq, y_val_seq), batch_size=batch_size, shuffle=False)
+
+        model_kwargs = {
+            'input_size': input_size,
+            'hidden_size': hidden_size,
+            'dropout_rate': dropout_rate,
+            'num_layers': num_layers
+        }
+        if model_class.__name__ == "VolatilidadCNN":
+            model_kwargs['kernel_size'] = kernel_size
+
+        model = model_class(**model_kwargs).to(device)
+        criterion = QLIKELoss().to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Entrenamiento con Early Stopping
+        train_fold(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            epochs=epochs,
+            fold_idx=fold_idx,
+            device=device,
+            patience=patience,
+            log_to_wandb=True
+        )
+
+        # Evaluación desacoplada y determinística (Dropout OFF)
+        val_eval = evaluate_model_qlike(model, val_loader, device)
+        train_eval = evaluate_model_qlike(model, train_eval_loader, device)
+
+        fold_val_means.append(val_eval['mean_qlike'])
+        fold_val_medians.append(val_eval['median_qlike'])
+        fold_train_means.append(train_eval['mean_qlike'])
+        fold_train_medians.append(train_eval['median_qlike'])
+
+        start_idx += step_days
+        fold_idx += 1
+
+    # Métricas consolidadas del modelo
+    val_mean_qlike = float(np.mean(fold_val_means))
+    val_median_qlike = float(np.mean(fold_val_medians))
+    val_std_folds = float(np.std(fold_val_means, ddof=1))
+
+    train_mean_qlike = float(np.mean(fold_train_means))
+    train_median_qlike = float(np.mean(fold_train_medians))
+    train_std_folds = float(np.std(fold_train_means, ddof=1))
+
+    generalization_gap = float(val_mean_qlike - train_mean_qlike)
+
+    if wandb.run is not None:
+        summary_payload = {
+            # Validación
+            "val_mean_qlike": val_mean_qlike,
+            "val_median_qlike": val_median_qlike,
+            "val_std_folds": val_std_folds,
+            # Entrenamiento
+            "train_mean_qlike": train_mean_qlike,
+            "train_median_qlike": train_median_qlike,
+            "train_std_folds": train_std_folds,
+            # Brecha de generalización
+            "generalization_gap": generalization_gap,
+            # Retrocompatibilidad
+            "avg_cross_val_loss": val_mean_qlike
+        }
+        wandb.log(summary_payload)
+        for k, v in summary_payload.items():
+            wandb.run.summary[k] = v
+
+    return {
+        'val_mean_qlike': val_mean_qlike,
+        'val_median_qlike': val_median_qlike,
+        'val_std_folds': val_std_folds,
+        'train_mean_qlike': train_mean_qlike,
+        'train_median_qlike': train_median_qlike,
+        'train_std_folds': train_std_folds,
+        'generalization_gap': generalization_gap
+    }
 
 def run_walk_forward(
     model_class, 
@@ -139,21 +310,26 @@ def run_walk_forward(
     y_raw, 
     dates, 
     config, 
-    train_window_days=1095,  # 3 años
-    val_window_days=182,     # 6 meses (~1 semestre)
+    train_window_days=1095,
+    val_window_days=182,
     step_days=182,
     epochs=45, 
     patience=10,
     seed=42
 ):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
+    set_deterministic_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     total_days = len(X_raw)
     input_size = X_raw.shape[1]
+
+    timesteps = _extract_config_value(config, 'timesteps', 7)
+    batch_size = _extract_config_value(config, 'batch_size', 32)
+    hidden_size = _extract_config_value(config, 'hidden_size', 32)
+    dropout_rate = _extract_config_value(config, 'dropout_rate', 0.3)
+    learning_rate = _extract_config_value(config, 'learning_rate', 1e-3)
+    weight_decay = _extract_config_value(config, 'weight_decay', 1e-4)
+    kernel_size = _extract_config_value(config, 'kernel_size', 3)
+    num_layers = _extract_config_value(config, 'num_layers', 1)
 
     fold_metrics = []
     all_predictions = []
@@ -168,10 +344,9 @@ def run_walk_forward(
         val_start = train_end
         val_end = min(val_start + val_window_days, total_days)
 
-        if (val_end - val_start) < 90:  # Descarta fragmentos menores a un trimestre
+        if (val_end - val_start) < 90:
             break
 
-        # 1. Partición cronológica estricta
         X_train_fold = X_raw[train_start:train_end]
         y_train_fold = y_raw[train_start:train_end]
         dates_train = dates[train_start:train_end]
@@ -180,49 +355,30 @@ def run_walk_forward(
         y_val_fold = y_raw[val_start:val_end]
         dates_val = dates[val_start:val_end]
 
-        # 2. RobustScaler ajustado estrictamente sobre el fold de entrenamiento
         scaler = RobustScaler()
         X_train_scaled = scaler.fit_transform(X_train_fold)
         X_val_scaled = scaler.transform(X_val_fold)
 
-        # 3. Construcción de tensores con timesteps
-        X_train_seq, y_train_seq, _ = create_sequences_with_dates(
-            X_train_scaled, y_train_fold, dates_train, config['timesteps']
-        )
-        X_val_seq, y_val_seq, d_val_seq = create_sequences_with_dates(
-            X_val_scaled, y_val_fold, dates_val, config['timesteps']
-        )
+        X_train_seq, y_train_seq, _ = create_sequences_with_dates(X_train_scaled, y_train_fold, dates_train, timesteps)
+        X_val_seq, y_val_seq, d_val_seq = create_sequences_with_dates(X_val_scaled, y_val_fold, dates_val, timesteps)
 
-        train_loader = DataLoader(
-            TensorDataset(X_train_seq, y_train_seq), 
-            batch_size=config['batch_size'], 
-            shuffle=True
-        )
-        val_loader = DataLoader(
-            TensorDataset(X_val_seq, y_val_seq), 
-            batch_size=config['batch_size'], 
-            shuffle=False
-        )
+        train_loader = DataLoader(TensorDataset(X_train_seq, y_train_seq), batch_size=batch_size, shuffle=True)
+        train_eval_loader = DataLoader(TensorDataset(X_train_seq, y_train_seq), batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(TensorDataset(X_val_seq, y_val_seq), batch_size=batch_size, shuffle=False)
 
-        # 4. Instanciación con kwargs completos (evita omisión de kernel y layers en CNN)
         model_kwargs = {
             'input_size': input_size,
-            'hidden_size': config['hidden_size'],
-            'dropout_rate': config['dropout_rate'],
-            'num_layers': config.get('num_layers', 1)
+            'hidden_size': hidden_size,
+            'dropout_rate': dropout_rate,
+            'num_layers': num_layers
         }
-        if 'kernel_size' in config:
-            model_kwargs['kernel_size'] = config['kernel_size']
+        if model_class.__name__ == "VolatilidadCNN":
+            model_kwargs['kernel_size'] = kernel_size
 
         model = model_class(**model_kwargs).to(device)
         criterion = QLIKELoss().to(device)
-        optimizer = optim.AdamW(
-            model.parameters(), 
-            lr=config['learning_rate'], 
-            weight_decay=config['weight_decay']
-        )
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-        # 5. Entrenamiento
         best_loss, history = train_fold(
             model=model,
             train_loader=train_loader,
@@ -232,22 +388,29 @@ def run_walk_forward(
             epochs=epochs,
             fold_idx=fold_idx,
             device=device,
-            patience=patience
+            patience=patience,
+            log_to_wandb=False
         )
 
-        # 6. Extracción de predicciones y métricas
-        pred_df = evaluate_fold_predictions(model, val_loader, d_val_seq, criterion, device)
-        pred_df['fold'] = fold_idx
-        pred_df['seed'] = seed
-        all_predictions.append(pred_df)
+        val_eval = evaluate_model_qlike(model, val_loader, device)
+        train_eval = evaluate_model_qlike(model, train_eval_loader, device)
 
-        fold_mean_qlike = float(pred_df['qlike'].mean())
-        fold_median_qlike = float(pred_df['qlike'].median())
+        records_df = pd.DataFrame({
+            'Date': d_val_seq,
+            'y_true': val_eval['y_true'],
+            'sigma2_pred': val_eval['sigma2_pred'],
+            'qlike': val_eval['qlike_arr'],
+            'fold': fold_idx,
+            'seed': seed
+        })
+        all_predictions.append(records_df)
 
         fold_metrics.append({
             'fold': fold_idx,
-            'mean_qlike': fold_mean_qlike,
-            'median_qlike': fold_median_qlike,
+            'val_mean_qlike': val_eval['mean_qlike'],
+            'val_median_qlike': val_eval['median_qlike'],
+            'train_mean_qlike': train_eval['mean_qlike'],
+            'train_median_qlike': train_eval['median_qlike'],
             'best_val_loss': best_loss
         })
         all_histories[f'fold_{fold_idx}'] = history
@@ -257,5 +420,4 @@ def run_walk_forward(
 
     df_preds = pd.concat(all_predictions, ignore_index=True)
     df_metrics = pd.DataFrame(fold_metrics)
-    
     return df_metrics, df_preds, all_histories

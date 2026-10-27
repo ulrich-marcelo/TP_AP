@@ -4,12 +4,10 @@ from pathlib import Path
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))
+    sys.path.insert(0, str(ROOT))
 
 import wandb
-from src.data_loader import load_processed_data
-from src.models import VolatilidadLSTM
-from src.trainer import run_walk_forward_sweep
+from src import load_processed_data, VolatilidadLSTM, run_walk_forward_sweep
 
 DATA_PATH = ROOT / "data" / "processed" / "processed_data.csv"
 X_raw, y_raw = load_processed_data(DATA_PATH)
@@ -18,9 +16,10 @@ def sweep_agent_wrapper():
     wandb.init()
     config = wandb.config
 
-    for f in range(7):
-        wandb.define_metric(f"fold_{f}_train_loss", step_metric="epoch")
-        wandb.define_metric(f"fold_{f}_val_loss", step_metric="epoch")
+    for f in range(14):
+        wandb.define_metric(f"fold_{f}_epoch")
+        wandb.define_metric(f"fold_{f}_train_loss", step_metric=f"fold_{f}_epoch")
+        wandb.define_metric(f"fold_{f}_val_loss", step_metric=f"fold_{f}_epoch")
 
     run_walk_forward_sweep(
         model_class=VolatilidadLSTM,
@@ -28,7 +27,11 @@ def sweep_agent_wrapper():
         y_raw=y_raw,
         config=config,
         epochs=45,
-        patience=10
+        patience=10,
+        seed=42,
+        train_window_days=1095,
+        val_window_days=182,
+        step_days=182
     )
 
 sweep_config = {
@@ -51,6 +54,7 @@ sweep_config = {
         },
         'dropout_rate': {'values': [0.2, 0.3, 0.4, 0.5]},
         'hidden_size': {'values': [16, 24, 32]},
+        'num_layers': {'values': [1, 2]},
         'timesteps': {'values': [5, 7, 14, 21]},
         'batch_size': {'values': [16, 32, 64]}
     }
