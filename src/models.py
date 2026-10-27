@@ -2,16 +2,17 @@ import torch
 import torch.nn as nn
 
 class VolatilidadGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size, dropout_rate=0.3, num_layers=1, **kwargs):
         super(VolatilidadGRU, self).__init__()
         self.gru = nn.GRU(
             input_size=input_size, 
             hidden_size=hidden_size, 
-            num_layers=1, 
+            num_layers=num_layers, 
             batch_first=True
         )
         self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(hidden_size, 1)
+        nn.init.constant_(self.fc.bias, -6.5)
 
     def forward(self, x):
         out, _ = self.gru(x)
@@ -21,16 +22,17 @@ class VolatilidadGRU(nn.Module):
 
 
 class VolatilidadLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size, dropout_rate=0.3, num_layers=1, **kwargs):
         super(VolatilidadLSTM, self).__init__()
         self.lstm = nn.LSTM(
             input_size=input_size, 
             hidden_size=hidden_size, 
-            num_layers=1, 
+            num_layers=num_layers, 
             batch_first=True
         )
         self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(hidden_size, 1)
+        nn.init.constant_(self.fc.bias, -6.5)
 
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -40,11 +42,10 @@ class VolatilidadLSTM(nn.Module):
 
 
 class VolatilidadCNN(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout_rate=0.3, kernel_size=3, num_layers=1):
+    def __init__(self, input_size, hidden_size, dropout_rate=0.3, kernel_size=3, num_layers=1, **kwargs):
         super(VolatilidadCNN, self).__init__()
         self.num_layers = num_layers
         
-        # padding='same' mantiene la longitud de la secuencia temporal constante
         self.conv1 = nn.Conv1d(
             in_channels=input_size,
             out_channels=hidden_size,
@@ -53,7 +54,6 @@ class VolatilidadCNN(nn.Module):
         )
         self.act1 = nn.GELU()
         
-        # Segunda capa opcional controlada por el optimizador bayesiano
         if self.num_layers == 2:
             self.conv2 = nn.Conv1d(
                 in_channels=hidden_size,
@@ -66,11 +66,10 @@ class VolatilidadCNN(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(2)
         self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(hidden_size * 2, 1)
-        
-        # Inicialización del bias para estabilizar el QLIKE inicial
         nn.init.constant_(self.fc.bias, -6.5)
 
     def forward(self, x):
+        # Transponer de (Batch, Timesteps, Channels) a (Batch, Channels, Timesteps)
         x = x.transpose(1, 2)
         x = self.act1(self.conv1(x))
         

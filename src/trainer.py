@@ -1,11 +1,11 @@
 import copy
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import RobustScaler
 from torch.utils.data import DataLoader, TensorDataset
-import wandb
 
 class QLIKELoss(nn.Module):
     def __init__(self, eps=1e-6):
@@ -13,6 +13,7 @@ class QLIKELoss(nn.Module):
         self.eps = eps
 
     def forward(self, h_pred, y_true):
+        # h_pred es ln(sigma^2), la red predice la varianza en escala logarítmica
         hat_sigma2 = torch.exp(h_pred)
         hat_sigma2 = torch.clamp(hat_sigma2, min=self.eps)
         y_true = torch.clamp(y_true, min=self.eps)
@@ -20,12 +21,17 @@ class QLIKELoss(nn.Module):
         loss = ratio - torch.log(ratio) - 1.0
         return torch.mean(loss)
 
-def create_sequences(features, target, timesteps):
-    X, y = [], []
+def create_sequences_with_dates(features, target, dates, timesteps):
+    X, y, d = [], [], []
     for i in range(len(features) - timesteps):
         X.append(features[i:(i + timesteps)])
         y.append(target[i + timesteps - 1])
-    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(y), dtype=torch.float32)
+        d.append(dates[i + timesteps - 1])
+    return (
+        torch.tensor(np.array(X), dtype=torch.float32),
+        torch.tensor(np.array(y), dtype=torch.float32),
+        np.array(d)
+    )
 
 def train_fold(
     model, 
@@ -50,18 +56,15 @@ def train_fold(
         train_loss_epoch = 0.0
 
         for X_batch, y_batch in train_loader:
-            # Transferencia de tensores a GPU/CPU
             X_batch = X_batch.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            h_pred = model(X_batch).squeeze()
+            h_pred = model(X_batch).squeeze(-1)
             loss = criterion(h_pred, y_batch)
             loss.backward()
 
-            # Gradient clipping estricto
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-
             optimizer.step()
             train_loss_epoch += loss.item() * X_batch.size(0)
 
@@ -73,8 +76,7 @@ def train_fold(
             for X_batch, y_batch in val_loader:
                 X_batch = X_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
-
-                h_pred = model(X_batch).squeeze()
+                h_pred = model(X_batch).squeeze(-1)
                 loss = criterion(h_pred, y_batch)
                 val_loss_epoch += loss.item() * X_batch.size(0)
 
@@ -83,13 +85,6 @@ def train_fold(
         history['train_loss'].append(train_loss_epoch)
         history['val_loss'].append(val_loss_epoch)
 
-        wandb.log({
-            f"fold_{fold_idx}_train_loss": train_loss_epoch,
-            f"fold_{fold_idx}_val_loss": val_loss_epoch,
-            "epoch": epoch
-        })
-
-        # Early Stopping por fold
         if val_loss_epoch < best_val_loss - min_delta:
             best_val_loss = val_loss_epoch
             best_model_state = copy.deepcopy(model.state_dict())
@@ -105,82 +100,130 @@ def train_fold(
 
     return best_val_loss, history
 
-def run_walk_forward_sweep(model_class, X_raw, y_raw, config, epochs=45, patience=10):
+def evaluate_fold_predictions(model, val_loader, val_dates, criterion, device):
     """
-    model_class: Clase de PyTorch sin instanciar (ej: VolatilidadGRU)
-    X_raw, y_raw: Dataset completo
-    config: Objeto de configuración de Weights & Biases
+    Computa y retorna las predicciones desescaladas y métricas individuales.
     """
-    # Detección automática del dispositivo de cómputo
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_pin_memory = (device.type == "cuda")
+    model.eval()
+    y_trues, h_preds = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch = X_batch.to(device)
+            h = model(X_batch).squeeze(-1)
+            h_preds.extend(h.cpu().numpy().tolist())
+            y_trues.extend(y_batch.numpy().tolist())
 
+    y_trues = np.array(y_trues)
+    h_preds = np.array(h_preds)
+    sigma2_pred = np.exp(h_preds)
+    
+    # QLIKE por día individual
+    eps = 1e-6
+    sigma2_safe = np.clip(sigma2_pred, eps, None)
+    y_safe = np.clip(y_trues, eps, None)
+    ratio = y_safe / sigma2_safe
+    pointwise_qlike = ratio - np.log(ratio) - 1.0
+
+    records = pd.DataFrame({
+        'Date': val_dates,
+        'y_true': y_trues,
+        'h_pred': h_preds,
+        'sigma2_pred': sigma2_pred,
+        'qlike': pointwise_qlike
+    })
+    return records
+
+def run_walk_forward(
+    model_class, 
+    X_raw, 
+    y_raw, 
+    dates, 
+    config, 
+    train_window_days=1095,  # 3 años
+    val_window_days=182,     # 6 meses (~1 semestre)
+    step_days=182,
+    epochs=45, 
+    patience=10,
+    seed=42
+):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     total_days = len(X_raw)
-    train_window = 3 * 365 
-    val_window = 365 
     input_size = X_raw.shape[1]
 
-    fold_val_losses = []
+    fold_metrics = []
+    all_predictions = []
+    all_histories = {}
+
     start_idx = 0
     fold_idx = 0
 
-    while start_idx + train_window < total_days:
+    while start_idx + train_window_days < total_days:
         train_start = start_idx
-        train_end = start_idx + train_window
+        train_end = start_idx + train_window_days
         val_start = train_end
-        val_end = min(val_start + val_window, total_days)
+        val_end = min(val_start + val_window_days, total_days)
 
-        if val_end - val_start < 180:
+        if (val_end - val_start) < 90:  # Descarta fragmentos menores a un trimestre
             break
 
-        # 1. Particionado estricto
+        # 1. Partición cronológica estricta
         X_train_fold = X_raw[train_start:train_end]
         y_train_fold = y_raw[train_start:train_end]
+        dates_train = dates[train_start:train_end]
+
         X_val_fold = X_raw[val_start:val_end]
         y_val_fold = y_raw[val_start:val_end]
+        dates_val = dates[val_start:val_end]
 
-        # 2. RobustScaler aislado por fold
+        # 2. RobustScaler ajustado estrictamente sobre el fold de entrenamiento
         scaler = RobustScaler()
         X_train_scaled = scaler.fit_transform(X_train_fold)
         X_val_scaled = scaler.transform(X_val_fold)
 
-        # 3. Creación de secuencias
-        X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_fold, config.timesteps)
-        X_val_seq, y_val_seq = create_sequences(X_val_scaled, y_val_fold, config.timesteps)
-
-        # 4. DataLoaders con memoria paginada para acelerar copia a GPU
-        train_dataset = TensorDataset(X_train_seq, y_train_seq)
-        val_dataset = TensorDataset(X_val_seq, y_val_seq)
+        # 3. Construcción de tensores con timesteps
+        X_train_seq, y_train_seq, _ = create_sequences_with_dates(
+            X_train_scaled, y_train_fold, dates_train, config['timesteps']
+        )
+        X_val_seq, y_val_seq, d_val_seq = create_sequences_with_dates(
+            X_val_scaled, y_val_fold, dates_val, config['timesteps']
+        )
 
         train_loader = DataLoader(
-            train_dataset, 
-            batch_size=config.batch_size, 
-            shuffle=True,
-            pin_memory=use_pin_memory
+            TensorDataset(X_train_seq, y_train_seq), 
+            batch_size=config['batch_size'], 
+            shuffle=True
         )
         val_loader = DataLoader(
-            val_dataset, 
-            batch_size=config.batch_size, 
-            shuffle=False,
-            pin_memory=use_pin_memory
+            TensorDataset(X_val_seq, y_val_seq), 
+            batch_size=config['batch_size'], 
+            shuffle=False
         )
 
-        # 5. Instanciación y migración del modelo al dispositivo
-        model = model_class(
-            input_size=input_size,
-            hidden_size=config.hidden_size,
-            dropout_rate=config.dropout_rate
-        ).to(device)
+        # 4. Instanciación con kwargs completos (evita omisión de kernel y layers en CNN)
+        model_kwargs = {
+            'input_size': input_size,
+            'hidden_size': config['hidden_size'],
+            'dropout_rate': config['dropout_rate'],
+            'num_layers': config.get('num_layers', 1)
+        }
+        if 'kernel_size' in config:
+            model_kwargs['kernel_size'] = config['kernel_size']
 
+        model = model_class(**model_kwargs).to(device)
         criterion = QLIKELoss().to(device)
         optimizer = optim.AdamW(
             model.parameters(), 
-            lr=config.learning_rate, 
-            weight_decay=config.weight_decay
+            lr=config['learning_rate'], 
+            weight_decay=config['weight_decay']
         )
 
-        # 6. Entrenamiento del fold
-        best_fold_loss, _ = train_fold(
+        # 5. Entrenamiento
+        best_loss, history = train_fold(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -192,14 +235,27 @@ def run_walk_forward_sweep(model_class, X_raw, y_raw, config, epochs=45, patienc
             patience=patience
         )
 
-        fold_val_losses.append(best_fold_loss)
+        # 6. Extracción de predicciones y métricas
+        pred_df = evaluate_fold_predictions(model, val_loader, d_val_seq, criterion, device)
+        pred_df['fold'] = fold_idx
+        pred_df['seed'] = seed
+        all_predictions.append(pred_df)
 
-        start_idx += val_window
+        fold_mean_qlike = float(pred_df['qlike'].mean())
+        fold_median_qlike = float(pred_df['qlike'].median())
+
+        fold_metrics.append({
+            'fold': fold_idx,
+            'mean_qlike': fold_mean_qlike,
+            'median_qlike': fold_median_qlike,
+            'best_val_loss': best_loss
+        })
+        all_histories[f'fold_{fold_idx}'] = history
+
+        start_idx += step_days
         fold_idx += 1
 
-    avg_val_loss = float(np.mean(fold_val_losses))
-    wandb.log({
-        "avg_cross_val_loss": avg_val_loss,
-        "device": str(device)
-    })
-    return avg_val_loss
+    df_preds = pd.concat(all_predictions, ignore_index=True)
+    df_metrics = pd.DataFrame(fold_metrics)
+    
+    return df_metrics, df_preds, all_histories
