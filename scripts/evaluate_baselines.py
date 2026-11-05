@@ -1,9 +1,10 @@
 import sys
+import warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from arch import arch_model
-import warnings
+
 warnings.filterwarnings("ignore")
 
 # 1. Resolución canónica de rutas
@@ -14,34 +15,53 @@ if str(ROOT) not in sys.path:
 
 from src.data_loader import load_processed_data_with_dates
 
-def evaluate_arch_walk_forward(
-    model_name,
-    returns_pct,
-    df_exog,
-    real_vol_proxy,
-    dates,
-    p=1,
-    q=3,
-    dist='ged',
-    use_exog=False,
+DATA_PATH = ROOT / "data" / "processed" / "processed_data.csv"
+RESULTS_DIR = ROOT / "results"
+RESULTS_DIR.mkdir(exist_ok=True, parents=True)
+
+def compute_qlike(y_true, sigma2_pred, eps=1e-6):
+    """Pérdida QLIKE vectorial numéricamente estable."""
+    y = np.clip(np.asarray(y_true, dtype=np.float64), eps, None)
+    s2 = np.clip(np.asarray(sigma2_pred, dtype=np.float64), eps, None)
+    ratio = y / s2
+    return ratio - np.log(ratio) - 1.0
+
+def evaluate_all_baselines(
     train_window_days=1095,
     val_window_days=182,
     step_days=182
 ):
     """
-    Ejecuta el Walk-Forward semestral para un modelo de la familia GARCH/EGARCH
-    registrando métricas puntuales por fold y globales.
+    Ejecuta el Walk-Forward semestral para los 3 baselines:
+    1. Benchmark_Promedio: Varianza Incondicional Móvil (Rolling Unconditional Mean)
+    2. EGARCH(1,3)_GED: Asimétrico Univariado con colas pesadas
+    3. EGARCH(1,3)-X_NORMAL: Asimétrico Multivariado con covariables exógenas
     """
-    total_obs = len(returns_pct)
-    eps = 1e-6
-    
-    fold_metrics = []
+    df, X, y, dates, feature_names = load_processed_data_with_dates(DATA_PATH)
+    total_obs = len(y)
+
+    # Retorno y proxy en escala porcentual (100 * r) para convergencia numérica de MLE en arch
+    returns_pct = pd.Series(
+        np.sign(df['BTC_r_oc'].values) * np.sqrt(y) * 100.0,
+        index=df.index,
+        name='BTC_Returns_Pct'
+    )
+    real_vol_proxy_pct = returns_pct ** 2  # Escala %^2 (10000 * y)
+
+    # Covariables exógenas para EGARCH-X
+    exog_cols = ['SPY_r_oc', 'SPY_r_vol', 'SPY_r_overnight', 'VIX_log']
+    df_exog = df[exog_cols].copy()
+
     all_predictions = []
-    
+    all_folds_detail = []
+
+    print("\n" + "="*85)
+    print("EJECUTANDO EVALUACIÓN UNIFICADA DE BASELINES (WALK-FORWARD 2019-2025)")
+    print("="*85)
+    print(f"Total datos: {total_obs} | Ventana entrenamiento: {train_window_days} | Test: {val_window_days}")
+
     start_idx = 0
     fold_idx = 0
-    
-    print(f"\n--- Evaluando {model_name} (p={p}, q={q}, dist={dist.upper()}, exog={use_exog}) ---")
 
     while start_idx + train_window_days < total_obs:
         train_start = start_idx
@@ -52,203 +72,185 @@ def evaluate_arch_walk_forward(
         if (val_end - val_start) < 90:
             break
 
+        val_dates = df.index[val_start:val_end]
+        n_samples = val_end - val_start
+
+        # Datos en escala decimal (estándar Deep Learning)
+        y_train_dec = y[train_start:train_end]
+        y_val_dec = y[val_start:val_end]
+
+        # Datos en escala porcentual (para arch_model)
         chunk_ret = returns_pct.iloc[:val_end]
-        val_dates = dates[val_start:val_end]
-        y_val_real = real_vol_proxy.iloc[val_start:val_end].values
+        chunk_exog = df_exog.iloc[:val_end]
+        test_dates = chunk_ret.index[val_start:val_end]
+        last_train_date = chunk_ret.index[train_end - 1]
 
-        # Configuración de variables exógenas
-        chunk_exog = df_exog.iloc[:val_end] if use_exog else None
+        print(f"\n>> Procesando Fold {fold_idx:02d} ({val_dates[0].strftime('%Y-%m-%d')} a {val_dates[-1].strftime('%Y-%m-%d')}) | {n_samples} días")
 
-        am = arch_model(
+        # -------------------------------------------------------------
+        # 1. BASELINE TRIVIAL: PROMEDIO MÓVIL (VARIANZA INCONDICIONAL)
+        # -------------------------------------------------------------
+        rolling_var_dec = float(np.mean(y_train_dec))
+        pred_promedio_dec = np.full(n_samples, rolling_var_dec)
+        qlike_promedio = compute_qlike(y_val_dec, pred_promedio_dec)
+
+        all_folds_detail.append({
+            'model': 'Benchmark_Promedio',
+            'fold': fold_idx,
+            'val_start': val_dates[0].strftime('%Y-%m-%d'),
+            'val_end': val_dates[-1].strftime('%Y-%m-%d'),
+            'samples': n_samples,
+            'mean_qlike': float(np.mean(qlike_promedio)),
+            'median_qlike': float(np.median(qlike_promedio)),
+            'std_daily': float(np.std(qlike_promedio, ddof=1)),
+            'converged': True
+        })
+
+        for d, yt, sp, ql in zip(val_dates, y_val_dec, pred_promedio_dec, qlike_promedio):
+            all_predictions.append({
+                'Date': pd.to_datetime(d),
+                'fold': fold_idx,
+                'model': 'Benchmark_Promedio',
+                'y_true': yt,
+                'sigma2_pred': sp,
+                'sigma2_pred_pct': sp * 10000.0,
+                'qlike': ql
+            })
+
+        # -------------------------------------------------------------
+        # 2. BASELINE ECONOMÉTRICO 1: EGARCH(1,3)_GED (Univariado)
+        # -------------------------------------------------------------
+        am_ged = arch_model(
+            chunk_ret,
+            mean='Constant',
+            vol='EGARCH',
+            p=1, o=1, q=3,
+            dist='ged'
+        )
+        try:
+            res_ged = am_ged.fit(last_obs=last_train_date, disp='off', show_warning=False)
+            f_ged = res_ged.forecast(horizon=1, align='target')
+            s2_ged_pct = f_ged.variance['h.1'].loc[test_dates].values
+            s2_ged_dec = s2_ged_pct / 10000.0
+            qlike_ged = compute_qlike(y_val_dec, s2_ged_dec)
+            conv_ged = (res_ged.convergence_flag == 0)
+        except Exception as e:
+            print(f"   [!] Error en EGARCH(1,3)_GED Fold {fold_idx}: {e}")
+            s2_ged_dec = pred_promedio_dec
+            s2_ged_pct = pred_promedio_dec * 10000.0
+            qlike_ged = qlike_promedio
+            conv_ged = False
+
+        all_folds_detail.append({
+            'model': 'EGARCH(1,3)_GED',
+            'fold': fold_idx,
+            'val_start': val_dates[0].strftime('%Y-%m-%d'),
+            'val_end': val_dates[-1].strftime('%Y-%m-%d'),
+            'samples': n_samples,
+            'mean_qlike': float(np.mean(qlike_ged)),
+            'median_qlike': float(np.median(qlike_ged)),
+            'std_daily': float(np.std(qlike_ged, ddof=1)),
+            'converged': conv_ged
+        })
+
+        for d, yt, sp, spp, ql in zip(val_dates, y_val_dec, s2_ged_dec, s2_ged_pct, qlike_ged):
+            all_predictions.append({
+                'Date': pd.to_datetime(d),
+                'fold': fold_idx,
+                'model': 'EGARCH(1,3)_GED',
+                'y_true': yt,
+                'sigma2_pred': sp,
+                'sigma2_pred_pct': spp,
+                'qlike': ql
+            })
+
+        # -------------------------------------------------------------
+        # 3. BASELINE ECONOMÉTRICO 2: EGARCH(1,3)-X_NORMAL (Multivariado)
+        # -------------------------------------------------------------
+        am_x = arch_model(
             chunk_ret,
             x=chunk_exog,
             mean='Constant',
             vol='EGARCH',
-            p=p,
-            o=1,  # Término de asimetría / apalancamiento
-            q=q,
-            dist=dist
+            p=1, o=1, q=3,
+            dist='normal'
         )
-
         try:
-            last_train_date = chunk_ret.index[train_end - 1]
-            res = am.fit(last_obs=last_train_date, disp='off', show_warning=False)
-
-            # Pronóstico a 1 paso adelante alineado al target t+1
-            forecasts = res.forecast(horizon=1, align='target')
-            
-            # Slicing riguroso: extraemos ÚNICAMENTE las predicciones del semestre out-of-sample
-            test_dates = chunk_ret.index[val_start:val_end]
-            sigma2_pred_pct = forecasts.variance['h.1'].loc[test_dates].values
-
-            # Conversión de escala: de retornos porcentuales^2 a varianza decimal
-            # y_val_real ya está en escala porcentual (100 * r_t)^2
-            ratio = np.clip(y_val_real, eps, None) / np.clip(sigma2_pred_pct, eps, None)
-            qlike_fold = ratio - np.log(ratio) - 1.0
-
-            fold_mean = float(np.mean(qlike_fold))
-            fold_median = float(np.median(qlike_fold))
-            fold_std_daily = float(np.std(qlike_fold, ddof=1))
-
-            fold_metrics.append({
-                'model': model_name,
-                'fold': fold_idx,
-                'val_start': test_dates[0].strftime('%Y-%m-%d'),
-                'val_end': test_dates[-1].strftime('%Y-%m-%d'),
-                'samples': len(qlike_fold),
-                'mean_qlike': fold_mean,
-                'median_qlike': fold_median,
-                'std_daily': fold_std_daily,
-                'converged': res.convergence_flag == 0
-            })
-
-            for d, yt, sp, ql in zip(val_dates, y_val_real, sigma2_pred_pct, qlike_fold):
-                all_predictions.append({
-                    'Date': d,
-                    'model': model_name,
-                    'fold': fold_idx,
-                    'y_true_pct': yt,
-                    'sigma2_pred_pct': sp,
-                    'qlike': ql
-                })
-
+            res_x = am_x.fit(last_obs=last_train_date, disp='off', show_warning=False)
+            f_x = res_x.forecast(horizon=1, align='target')
+            s2_x_pct = f_x.variance['h.1'].loc[test_dates].values
+            s2_x_dec = s2_x_pct / 10000.0
+            qlike_x = compute_qlike(y_val_dec, s2_x_dec)
+            conv_x = (res_x.convergence_flag == 0)
         except Exception as e:
-            print(f"Error en Fold {fold_idx}: {e}")
-            fold_metrics.append({
-                'model': model_name,
+            print(f"   [!] Error en EGARCH(1,3)-X_NORMAL Fold {fold_idx}: {e}")
+            s2_x_dec = pred_promedio_dec
+            s2_x_pct = pred_promedio_dec * 10000.0
+            qlike_x = qlike_promedio
+            conv_x = False
+
+        all_folds_detail.append({
+            'model': 'EGARCH(1,3)-X_NORMAL',
+            'fold': fold_idx,
+            'val_start': val_dates[0].strftime('%Y-%m-%d'),
+            'val_end': val_dates[-1].strftime('%Y-%m-%d'),
+            'samples': n_samples,
+            'mean_qlike': float(np.mean(qlike_x)),
+            'median_qlike': float(np.median(qlike_x)),
+            'std_daily': float(np.std(qlike_x, ddof=1)),
+            'converged': conv_x
+        })
+
+        for d, yt, sp, spp, ql in zip(val_dates, y_val_dec, s2_x_dec, s2_x_pct, qlike_x):
+            all_predictions.append({
+                'Date': pd.to_datetime(d),
                 'fold': fold_idx,
-                'val_start': dates[val_start].strftime('%Y-%m-%d'),
-                'val_end': dates[val_end - 1].strftime('%Y-%m-%d'),
-                'samples': val_end - val_start,
-                'mean_qlike': np.nan,
-                'median_qlike': np.nan,
-                'std_daily': np.nan,
-                'converged': False
+                'model': 'EGARCH(1,3)-X_NORMAL',
+                'y_true': yt,
+                'sigma2_pred': sp,
+                'sigma2_pred_pct': spp,
+                'qlike': ql
             })
+
+        print(f"   • Promedio:  QLIKE = {np.mean(qlike_promedio):.4f}")
+        print(f"   • EGARCH:    QLIKE = {np.mean(qlike_ged):.4f}")
+        print(f"   • EGARCH-X:  QLIKE = {np.mean(qlike_x):.4f}")
 
         start_idx += step_days
         fold_idx += 1
 
-    df_folds = pd.DataFrame(fold_metrics)
-    df_preds = pd.DataFrame(all_predictions)
+    # Consolidación final en DataFrames
+    df_preds_all = pd.DataFrame(all_predictions)
+    df_folds_all = pd.DataFrame(all_folds_detail)
 
-    # 4. Cálculo formal de Métricas Transversales y Globales
-    valid_folds = df_folds.dropna(subset=['mean_qlike'])
-    
-    # Media de las medias de los folds (Macro-average)
-    macro_mean_qlike = float(valid_folds['mean_qlike'].mean())
-    # Desviación estándar ENTRE FOLDS (std transversal de estabilidad temporal)
-    std_between_folds = float(valid_folds['mean_qlike'].std(ddof=1))
-    # Media de las medianas de los folds
-    macro_median_qlike = float(valid_folds['median_qlike'].mean())
+    # Resumen macro y micro
+    summary_rows = []
+    for model_name in ['Benchmark_Promedio', 'EGARCH(1,3)_GED', 'EGARCH(1,3)-X_NORMAL']:
+        sub_folds = df_folds_all[df_folds_all['model'] == model_name]
+        sub_preds = df_preds_all[df_preds_all['model'] == model_name]
 
-    # Métrica Micro: sobre toda la serie temporal continua concatenada
-    micro_mean_qlike = float(df_preds['qlike'].mean())
-    micro_median_qlike = float(df_preds['qlike'].median())
+        summary_rows.append({
+            'model': model_name,
+            'mean_qlike_macro': float(sub_folds['mean_qlike'].mean()),
+            'std_folds': float(sub_folds['mean_qlike'].std(ddof=1)),
+            'median_qlike_macro': float(sub_folds['median_qlike'].mean()),
+            'mean_qlike_micro': float(sub_preds['qlike'].mean()),
+            'median_qlike_micro': float(sub_preds['qlike'].median()),
+            'total_observations': len(sub_preds)
+        })
 
-    print(f"\nResultados Consolidados: {model_name}")
-    print(f" • QLIKE Promedio (Macro ± std folds): {macro_mean_qlike:.4f} ± {std_between_folds:.4f}")
-    print(f" • QLIKE Mediana Promedio (Folds):     {macro_median_qlike:.4f}")
-    print(f" • QLIKE Concatenado Global (Micro):   {micro_mean_qlike:.4f} (Mediana: {micro_median_qlike:.4f})")
-    print(f" • Total Folds Exitosos:               {len(valid_folds)}/{len(df_folds)}")
+    df_summary = pd.DataFrame(summary_rows)
 
-    return {
-        'model_name': model_name,
-        'macro_mean_qlike': macro_mean_qlike,
-        'std_between_folds': std_between_folds,
-        'macro_median_qlike': macro_median_qlike,
-        'micro_mean_qlike': micro_mean_qlike,
-        'micro_median_qlike': micro_median_qlike,
-        'df_folds': df_folds,
-        'df_preds': df_preds
-    }
+    # Persistencia de artefactos
+    df_preds_all.to_parquet(RESULTS_DIR / "baselines_predictions.parquet", index=False)
+    df_folds_all.to_csv(RESULTS_DIR / "baselines_folds_detail.csv", index=False)
+    df_summary.to_csv(RESULTS_DIR / "baselines_summary.csv", index=False)
 
-def main():
-    data_path = ROOT / "data" / "processed" / "processed_data.csv"
-    df, X, y, dates, feature_names = load_processed_data_with_dates(data_path)
-
-    # Retorno en escala porcentual (* 100) para estabilidad de optimización MLE
-    returns_pct = pd.Series(
-        np.sign(df['BTC_r_oc'].values) * np.sqrt(y) * 100.0,
-        index=df.index,
-        name='BTC_Returns_Pct'
-    )
-    real_vol_proxy = returns_pct ** 2
-
-    # Covariables exógenas seleccionadas declarativamente
-    exog_cols = ['SPY_r_oc', 'SPY_r_vol', 'SPY_r_overnight', 'VIX_log']
-    df_exog = df[exog_cols].copy()
-
-    # 1. Baseline 1: EGARCH(1,3)_GED (Univariado clásico de Econometría II)
-    res_egarch_ged = evaluate_arch_walk_forward(
-        model_name="EGARCH(1,3)_GED",
-        returns_pct=returns_pct,
-        df_exog=df_exog,
-        real_vol_proxy=real_vol_proxy,
-        dates=df.index,
-        p=1,
-        q=3,
-        dist='ged',
-        use_exog=False,
-        train_window_days=1095,
-        val_window_days=182,
-        step_days=182
-    )
-
-    # 2. Baseline 2: EGARCH(1,3)-X_NORMAL (Multivariado con exógenas)
-    res_egarch_x = evaluate_arch_walk_forward(
-        model_name="EGARCH(1,3)-X_NORMAL",
-        returns_pct=returns_pct,
-        df_exog=df_exog,
-        real_vol_proxy=real_vol_proxy,
-        dates=df.index,
-        p=1,
-        q=3,
-        dist='normal',
-        use_exog=True,
-        train_window_days=1095,
-        val_window_days=182,
-        step_days=182
-    )
-
-    # 3. Guardado consolidado de artefactos
-    results_dir = ROOT / "results"
-    results_dir.mkdir(exist_ok=True, parents=True)
-
-    summary_rows = [
-        {
-            'model': res_egarch_ged['model_name'],
-            'mean_qlike_macro': res_egarch_ged['macro_mean_qlike'],
-            'std_folds': res_egarch_ged['std_between_folds'],
-            'median_qlike_macro': res_egarch_ged['macro_median_qlike'],
-            'mean_qlike_micro': res_egarch_ged['micro_mean_qlike'],
-            'median_qlike_micro': res_egarch_ged['micro_median_qlike']
-        },
-        {
-            'model': res_egarch_x['model_name'],
-            'mean_qlike_macro': res_egarch_x['macro_mean_qlike'],
-            'std_folds': res_egarch_x['std_between_folds'],
-            'median_qlike_macro': res_egarch_x['macro_median_qlike'],
-            'mean_qlike_micro': res_egarch_x['micro_mean_qlike'],
-            'median_qlike_micro': res_egarch_x['micro_median_qlike']
-        }
-    ]
-
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(results_dir / "baselines_summary.csv", index=False)
-
-    # Guardar desglose por fold de ambos modelos
-    all_folds_df = pd.concat([res_egarch_ged['df_folds'], res_egarch_x['df_folds']], ignore_index=True)
-    all_folds_df.to_csv(results_dir / "baselines_folds_detail.csv", index=False)
-
-    # Guardar predicciones puntuales continuas para Test de Diebold-Mariano
-    all_preds_df = pd.concat([res_egarch_ged['df_preds'], res_egarch_x['df_preds']], ignore_index=True)
-    all_preds_df.to_parquet(results_dir / "baselines_predictions.parquet", index=False)
-
-    print("\n" + "="*80)
-    print("TABLA COMPARATIVA FINAL DE BASELINES (GUARDADA EN results/baselines_summary.csv):")
-    print("="*80)
-    print(summary_df.to_string(index=False))
+    print("\n" + "="*85)
+    print("RESUMEN GENERAL DE BASELINES (GUARDADO EN results/baselines_summary.csv):")
+    print("="*85)
+    print(df_summary.to_string(index=False))
+    print(f"\nPredicciones exportadas a: {RESULTS_DIR / 'baselines_predictions.parquet'}")
 
 if __name__ == "__main__":
-    main()
+    evaluate_all_baselines()
