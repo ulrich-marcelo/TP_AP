@@ -135,7 +135,7 @@ def load_all_models_data():
 def run_comprehensive_dm_tests(baselines, dl_models):
     """
     Ejecuta la batería de pruebas de Diebold-Mariano con corrección HLN (1997)
-    calculando en paralelo las pruebas bilaterales y unilaterales.
+    calculando en paralelo las pruebas bilaterales, unilaterales y el Error Estándar (HAC).
     """
     print("\n[2/4] Ejecutando contrastes estadísticos Diebold-Mariano (Bilateral y Unilateral)...")
     dm_records = []
@@ -154,6 +154,12 @@ def run_comprehensive_dm_tests(baselines, dl_models):
 
         # Ejecución del test base
         dm_stat, p_val_two = diebold_mariano_test(loss_b, loss_c, h=1)
+
+        # Despeje del Error Estándar (SE) a partir del estadístico DM
+        if dm_stat != 0:
+            se_d = abs(diff_mean / dm_stat)
+        else:
+            se_d = 0.0
 
         # Cálculo formal de la prueba unilateral (H1: E[d_t] > 0 -> Candidato supera a Base)
         # Se evalúa la cola derecha mediante la función de supervivencia (survival function)
@@ -186,6 +192,7 @@ def run_comprehensive_dm_tests(baselines, dl_models):
             'QLIKE_Base': float(np.mean(loss_b)),
             'QLIKE_Candidato': float(np.mean(loss_c)),
             'Diferencia_Media': diff_mean,
+            'Error_Estandar_HAC': se_d,
             'DM_Stat_HLN': dm_stat,
             'p_val_bilateral': p_val_two,
             'Signif_Bilateral': sig_two,
@@ -383,12 +390,12 @@ def main():
     df_dm = run_comprehensive_dm_tests(baselines, dl_models)
     generate_comparative_plots(baselines, dl_models)
 
-    print("\n" + "="*120)
+    print("\n" + "="*140)
     print("BATERÍA EXHAUSTIVA DE CONTRASTES DE HIPÓTESIS: DIEBOLD-MARIANO CON CORRECCIÓN HLN (1997)")
-    print("="*120)
+    print("="*140)
     display_cols = [
         'Tipo_Contraste', 'Modelo_Base', 'Modelo_Candidato', 'QLIKE_Base', 'QLIKE_Candidato',
-        'DM_Stat_HLN', 'p_val_bilateral', 'Signif_Bilateral', 'p_val_unilateral', 'Signif_Unilateral'
+        'Diferencia_Media', 'Error_Estandar_HAC', 'DM_Stat_HLN', 'p_val_bilateral', 'p_val_unilateral', 'Signif_Unilateral'
     ]
     print(df_dm[display_cols].to_string(index=False))
     print(f"\nResultados completos exportados a: {RESULTS_DIR / 'diebold_mariano_statistical_tests.csv'}")
