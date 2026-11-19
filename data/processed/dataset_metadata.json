@@ -1,0 +1,25 @@
+{
+  "start_date_requested": "2016-01-01",
+  "end_date_requested": "2026-11-01",
+  "actual_start_date": "2016-01-04",
+  "actual_end_date": "2026-10-30",
+  "total_observations": 3953,
+  "us_trading_days": 2723,
+  "us_non_trading_days": 1230,
+  "feature_columns": [
+    "BTC_r_oc",
+    "BTC_r_ho",
+    "BTC_r_lo",
+    "BTC_r_vol",
+    "SPY_r_oc",
+    "SPY_r_ho",
+    "SPY_r_lo",
+    "SPY_r_vol",
+    "SPY_r_overnight",
+    "VIX_log"
+  ],
+  "target_column": "target_r2_t1",
+  "target_mean": 0.0011975502907560695,
+  "target_median": 0.00019433653961184715,
+  "target_max": 0.21597413587133613
+}
