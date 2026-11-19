@@ -1,190 +1,285 @@
-import sys
-from pathlib import Path
 import itertools
+import json
+import sys
+import time
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from arch import arch_model
-import warnings
+
 warnings.filterwarnings("ignore")
 
-# 1. Resolución canónica de rutas
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data_loader import load_processed_data_with_dates
+from src.data_loader import load_processed_data_with_dates, load_returns_reference
+from src.econometrics import DEFAULT_EXOG_COLS, EGARCHXModel
+from src.evaluation import compute_qlike_vector, validate_predictions_integrity
 
-def run_egarch_x_walk_forward(returns, df_exog, real_vol_proxy, p, q, dist, window_size=1095, semester_len=182):
+DATA_PATH = ROOT / "data" / "processed" / "processed_data.csv"
+RESULTS_DIR = ROOT / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def run_egarch_x_walk_forward_phase_a(
+    df_proc: pd.DataFrame,
+    returns_pct: pd.Series,
+    df_exog: pd.DataFrame,
+    p: int,
+    q: int,
+    dist: str,
+    train_window_days: int = 1095,
+    val_window_days: int = 182,
+    step_days: int = 182,
+):
     """
-    Ejecuta el Walk-Forward semestral idéntico al baseline.ipynb para una especificación dada
-    y retorna la serie out-of-sample de QLIKE y sus métricas.
+    Ejecuta el Walk-Forward de EGARCH(p, 1, q)-X estrictamente sobre Fase A (2016-2025)
+    sin lookahead bias y guarda las predicciones diarias y parámetros por fold.
     """
-    total_obs = len(returns)
-    pred_vars_chunks = []
-    failed_folds = 0
-    total_folds = 0
+    total_obs = len(returns_pct)
+    y_dec_all = df_proc["target_r2_t1"].values
+    dates_all = df_proc.index
+    exog_cols = list(df_exog.columns)
 
-    for i in range(0, total_obs - window_size, semester_len):
-        current_train_end = window_size + i
-        current_test_end = min(current_train_end + semester_len, total_obs)
+    pred_rows = []
+    fold_rows = []
+    params_rows = []
 
-        if current_train_end >= total_obs:
+    start_idx = 0
+    fold_idx = 0
+
+    while start_idx + train_window_days < total_obs:
+        train_start = start_idx
+        train_end = start_idx + train_window_days
+        test_start = train_end
+        test_end = min(test_start + val_window_days, total_obs)
+
+        if (test_end - test_start) < 90:
             break
 
-        total_folds += 1
-        chunk_ret = returns.iloc[:current_test_end]
-        chunk_exog = df_exog.iloc[:current_test_end]
+        # 1. Ajuste MLE estrictamente con observaciones in-sample [train_start : train_end]
+        r_train = returns_pct.iloc[train_start:train_end].values
+        X_train = df_exog.iloc[train_start:train_end].values
 
-        am = arch_model(
-            chunk_ret,
-            x=chunk_exog,
-            mean='Constant',
-            vol='EGARCH',
-            p=p,
-            o=1,  # Término de asimetría / efecto apalancamiento
-            q=q,
-            dist=dist
-        )
+        model = EGARCHXModel(p=p, o=1, q=q, dist=dist)
+        try:
+            model.fit(r_train, X_train)
+            conv_ok = model.converged_
+        except Exception:
+            conv_ok = False
+
+        # 2. Pronóstico causal 1-paso adelante sobre [test_start : test_end]
+        r_hist_oos = returns_pct.iloc[train_start:test_end].values
+        X_hist_oos = df_exog.iloc[train_start:test_end].values
+        oos_offset = train_end - train_start
+
+        y_val_dec = y_dec_all[test_start:test_end]
+        val_dates = dates_all[test_start:test_end]
 
         try:
-            last_train_date = chunk_ret.index[current_train_end]
-            res = am.fit(last_obs=last_train_date, disp='off', show_warning=False)
-
-            if res.convergence_flag != 0:
-                failed_folds += 1
-
-            # Pronóstico fuera de muestra alineado al target t+1
-            forecasts = res.forecast(horizon=1, align='target')
-            
-            # Extraemos la varianza proyectada correspondiente únicamente a la ventana out-of-sample
-            test_dates = chunk_ret.index[current_train_end:current_test_end]
-            sem_forecast = forecasts.variance['h.1'].loc[test_dates]
-            pred_vars_chunks.append(sem_forecast)
-
+            if model.params_ is None:
+                raise RuntimeError("MLE sin parámetros válidos.")
+            s2_pred_pct = model.forecast_oos_1step(r_hist_oos, X_hist_oos, oos_start_idx=oos_offset)
+            s2_pred_dec = s2_pred_pct / 10000.0
         except Exception:
-            failed_folds += 1
-            continue
+            # Fallback conservador a varianza incondicional in-sample si fallara MLE
+            fallback_var = float(np.mean(y_dec_all[train_start:train_end]))
+            s2_pred_dec = np.full(len(y_val_dec), fallback_var, dtype=np.float64)
+            s2_pred_pct = s2_pred_dec * 10000.0
+            conv_ok = False
 
-    if len(pred_vars_chunks) == 0:
-        return None
+        qlike_vec = compute_qlike_vector(y_val_dec, s2_pred_dec)
 
-    # Concatenación y alineación temporal de predicciones
-    v_pred = pd.concat(pred_vars_chunks).dropna()
-    common_dates = v_pred.index.intersection(real_vol_proxy.index)
+        fold_rows.append({
+            "fold": fold_idx,
+            "val_start": val_dates[0].strftime("%Y-%m-%d"),
+            "val_end": val_dates[-1].strftime("%Y-%m-%d"),
+            "samples": len(qlike_vec),
+            "mean_qlike": float(np.mean(qlike_vec)),
+            "median_qlike": float(np.median(qlike_vec)),
+            "std_daily": float(np.std(qlike_vec, ddof=1)),
+            "aic": float(model.aic_),
+            "bic": float(model.bic_),
+            "converged": conv_ok,
+        })
 
-    if len(common_dates) == 0:
-        return None
+        if model.params_ is not None:
+            p_dict = model.get_params_dict(exog_cols)
+            p_dict.update({
+                "fold": fold_idx,
+                "val_start": val_dates[0].strftime("%Y-%m-%d"),
+                "val_end": val_dates[-1].strftime("%Y-%m-%d"),
+                "converged": conv_ok,
+                "mean_qlike": float(np.mean(qlike_vec)),
+            })
+            params_rows.append(p_dict)
 
-    v_pred = v_pred.loc[common_dates]
-    v_real = real_vol_proxy.loc[common_dates].squeeze()
+        for d, yt, spd, spp, ql in zip(val_dates, y_val_dec, s2_pred_dec, s2_pred_pct, qlike_vec):
+            pred_rows.append({
+                "Date": pd.to_datetime(d),
+                "phase": "Fase_A_Seleccion",
+                "fold": fold_idx,
+                "spec": f"EGARCH({p},{q})-X_{dist.upper()}",
+                "y_true": float(yt),
+                "sigma2_pred": float(spd),
+                "sigma2_pred_pct": float(spp),
+                "qlike": float(ql),
+            })
 
-    # Cálculo puntual de la pérdida QLIKE (escala-invariante)
-    # y / sigma^2 - ln(y / sigma^2) - 1
-    qlike_series = (v_real / v_pred) - np.log(v_real / v_pred) - 1.0
+        start_idx += step_days
+        fold_idx += 1
+
+    df_folds = pd.DataFrame(fold_rows)
+    df_preds = pd.DataFrame(pred_rows)
+    df_params = pd.DataFrame(params_rows)
+
+    failed_folds = int((~df_folds["converged"]).sum())
+    total_folds = int(len(df_folds))
 
     return {
-        'mean_qlike': float(qlike_series.mean()),
-        'median_qlike': float(qlike_series.median()),
-        'std_qlike': float(qlike_series.std()),
-        'failed_folds': failed_folds,
-        'total_folds': total_folds,
-        'qlike_series': qlike_series,
-        'v_pred': v_pred
+        "mean_qlike_macro": float(df_folds["mean_qlike"].mean()),
+        "mean_qlike_micro": float(df_preds["qlike"].mean()),
+        "median_qlike_micro": float(df_preds["qlike"].median()),
+        "std_folds": float(df_folds["mean_qlike"].std(ddof=1)),
+        "std_daily": float(df_preds["qlike"].std(ddof=1)),
+        "aic_mean": float(df_folds["aic"].mean()),
+        "bic_mean": float(df_folds["bic"].mean()),
+        "failed_folds": failed_folds,
+        "total_folds": total_folds,
+        "df_preds": df_preds,
+        "df_folds": df_folds,
+        "df_params": df_params,
     }
 
-def find_optimal_egarch_x_by_qlike(initial_train_days=1095, semester_len=182):
+
+def find_optimal_egarch_x_by_qlike(
+    train_window_days: int = 1095,
+    val_window_days: int = 182,
+    exog_cols: list = None,
+):
     """
-    Grid Search exhaustivo de EGARCH-X evaluado rigurosamente mediante QLIKE Out-of-Sample.
+    Grid Search de EGARCH(p, 1, q)-X evaluado exclusivamente sobre Fase A (2019-2025)
+    para preservar el test ciego de 2026 (Fase B).
     """
-    data_path = ROOT / "data" / "processed" / "processed_data.csv"
-    if not data_path.exists():
-        raise FileNotFoundError(f"No se encontró el dataset en: {data_path}")
+    if exog_cols is None:
+        exog_cols = list(DEFAULT_EXOG_COLS)
 
-    df, X, y, dates, feature_names = load_processed_data_with_dates(data_path)
+    # Carga estricta hasta PHASE_A_END_DATE (2025-12-25)
+    df_proc, _, _, _, _ = load_processed_data_with_dates(DATA_PATH, phase="phase_a")
+    df_ref = load_returns_reference(DATA_PATH, phase="phase_a")
 
-    # Reconstrucción de retornos en escala porcentual (100 * r_t) para estabilidad de arch_model
-    # target_r2_t1 es (r_{t+1})^2 en escala decimal
-    returns_pct = pd.Series(
-        np.sign(df['BTC_r_oc'].values) * np.sqrt(y) * 100.0,
-        index=df.index,
-        name='BTC_Returns_Pct'
-    )
+    # Retorno exacto close-to-close en t en escala porcentual (100 * r_t)
+    returns_pct = (df_ref["BTC_r_cc"] * 100.0).rename("BTC_Returns_Pct")
+    df_exog = df_proc[exog_cols].copy()
 
-    # Proxy de varianza real para la evaluación de QLIKE
-    real_vol_proxy = returns_pct.iloc[initial_train_days:] ** 2
-
-    # Variables exógenas seleccionadas declarativamente por nombre
-    exog_cols = ['SPY_r_oc', 'SPY_r_vol', 'SPY_r_overnight', 'VIX_log']
-    df_exog = df[exog_cols].copy()
-
-    # Grilla de hiperparámetros
     p_orders = [1, 2]
     q_orders = [1, 2, 3]
-    distributions = ['ged', 't', 'normal']
+    distributions = ["ged", "t", "normal"]
 
     grid_results = []
+    all_grid_preds = []
+    params_by_spec = {}
 
-    print("\n" + "="*80)
-    print("INICIANDO GRID SEARCH DE EGARCH-X BASADO EN QLIKE OUT-OF-SAMPLE (WALK-FORWARD)")
-    print("="*80)
-    print(f"Observaciones totales: {len(df)} | Ventana inicial: {initial_train_days} días | Bloque test: {semester_len} días")
-    print(f"Variables exógenas incorporadas: {exog_cols}\n")
+    print("\n" + "=" * 92)
+    print("GRID SEARCH DE EGARCH(p,1,q)-X EN VARIANZA — FASE A SELECCIÓN (2016–2025)")
+    print("=" * 92)
+    print(f"Observaciones Fase A: {len(df_proc)} | Ventana inicial: {train_window_days}d | Bloque test: {val_window_days}d")
+    print(f"Covariables exógenas en ecuación de log-varianza: {exog_cols}\n")
 
     for p, q, dist in itertools.product(p_orders, q_orders, distributions):
         spec_name = f"EGARCH({p},{q})-X_{dist.upper()}"
-        print(f"Evaluando {spec_name}...", end=" ", flush=True)
+        t0 = time.time()
+        print(f"Evaluando {spec_name:24s}...", end=" ", flush=True)
 
-        res_dict = run_egarch_x_walk_forward(
-            returns=returns_pct,
+        res = run_egarch_x_walk_forward_phase_a(
+            df_proc=df_proc,
+            returns_pct=returns_pct,
             df_exog=df_exog,
-            real_vol_proxy=real_vol_proxy,
             p=p,
             q=q,
             dist=dist,
-            window_size=initial_train_days,
-            semester_len=semester_len
+            train_window_days=train_window_days,
+            val_window_days=val_window_days,
+            step_days=val_window_days,
+        )
+        elapsed = time.time() - t0
+
+        print(
+            f"Mean QLIKE: {res['mean_qlike_micro']:.4f} | "
+            f"Mediana: {res['median_qlike_micro']:.4f} | "
+            f"BIC: {res['bic_mean']:.1f} | "
+            f"Fails: {res['failed_folds']}/{res['total_folds']} ({elapsed:.1f}s)"
         )
 
-        if res_dict is not None and not np.isnan(res_dict['mean_qlike']):
-            print(f"-> Mean QLIKE: {res_dict['mean_qlike']:.4f} | Median: {res_dict['median_qlike']:.4f} | Fails: {res_dict['failed_folds']}/{res_dict['total_folds']}")
-            grid_results.append({
-                'spec': spec_name,
-                'p': p,
-                'q': q,
-                'dist': dist,
-                'mean_qlike': res_dict['mean_qlike'],
-                'median_qlike': res_dict['median_qlike'],
-                'std_qlike': res_dict['std_qlike'],
-                'failed_folds': res_dict['failed_folds'],
-                'total_folds': res_dict['total_folds']
-            })
-        else:
-            print("-> Falló convergencia.")
+        grid_results.append({
+            "spec": spec_name,
+            "p": p,
+            "q": q,
+            "dist": dist,
+            "mean_qlike": res["mean_qlike_micro"],
+            "mean_qlike_macro": res["mean_qlike_macro"],
+            "median_qlike": res["median_qlike_micro"],
+            "std_folds": res["std_folds"],
+            "std_daily": res["std_daily"],
+            "aic_mean": res["aic_mean"],
+            "bic_mean": res["bic_mean"],
+            "failed_folds": res["failed_folds"],
+            "total_folds": res["total_folds"],
+        })
+        all_grid_preds.append(res["df_preds"])
+        params_by_spec[spec_name] = res["df_params"]
 
-    results_df = pd.DataFrame(grid_results)
-    
-    # Ordenamos estrictamente por QLIKE Promedio fuera de muestra
-    results_df = results_df.sort_values(by='mean_qlike').reset_index(drop=True)
+    results_df = pd.DataFrame(grid_results).sort_values(by="mean_qlike").reset_index(drop=True)
 
-    print("\n" + "="*80)
-    print("RANKING FINAL DE MODELOS EGARCH-X SEGÚN ERROR QLIKE (OUT-OF-SAMPLE):")
-    print("="*80)
-    print(results_df[['spec', 'mean_qlike', 'median_qlike', 'std_qlike', 'failed_folds']].to_string(index=False))
+    print("\n" + "=" * 92)
+    print("RANKING FINAL EGARCH-X SEGÚN QLIKE OUT-OF-SAMPLE (FASE A: 2019–2025):")
+    print("=" * 92)
+    disp_cols = ["spec", "mean_qlike", "median_qlike", "std_folds", "bic_mean", "failed_folds"]
+    print(results_df[disp_cols].to_string(index=False))
 
     best_model = results_df.iloc[0]
-    print("\n" + "-"*80)
-    print(f"ESPECIFICACIÓN ÓPTIMA SELECCIONADA POR QLIKE: {best_model['spec']}")
-    print(f"Mean QLIKE: {best_model['mean_qlike']:.4f} | Median QLIKE: {best_model['median_qlike']:.4f}")
-    print("-"*80)
+    best_spec = best_model["spec"]
 
-    # Persistencia del reporte
-    results_dir = ROOT / "results"
-    results_dir.mkdir(exist_ok=True, parents=True)
-    results_df.to_csv(results_dir / "egarch_x_qlike_grid_search.csv", index=False)
-    print(f"\nResultados guardados en: {results_dir / 'egarch_x_qlike_grid_search.csv'}")
+    print("\n" + "-" * 92)
+    print(f"ESPECIFICACIÓN ÓPTIMA CONGELADA PARA FASE B: {best_spec}")
+    print(f"Mean QLIKE: {best_model['mean_qlike']:.4f} | Median QLIKE: {best_model['median_qlike']:.4f}")
+    print("-" * 92)
+
+    # Validación estricta de integridad temporal antes de guardar predicciones diarias
+    master_grid_preds = pd.concat(all_grid_preds, ignore_index=True)
+    validate_predictions_integrity(master_grid_preds, df_proc, group_cols=["spec"])
+
+    # Persistencia completa
+    results_df.to_csv(RESULTS_DIR / "egarch_x_qlike_grid_search.csv", index=False)
+    master_grid_preds.to_parquet(RESULTS_DIR / "egarch_x_grid_predictions.parquet", index=False)
+
+    best_params_df = params_by_spec[best_spec]
+    best_params_df.to_csv(RESULTS_DIR / "egarch_x_best_params_by_fold.csv", index=False)
+
+    best_spec_payload = {
+        "spec": best_spec,
+        "p": int(best_model["p"]),
+        "o": 1,
+        "q": int(best_model["q"]),
+        "dist": str(best_model["dist"]),
+        "exog_cols": exog_cols,
+        "phase_a_mean_qlike": float(best_model["mean_qlike"]),
+        "phase_a_median_qlike": float(best_model["median_qlike"]),
+    }
+    with open(RESULTS_DIR / "egarch_x_best_spec.json", "w", encoding="utf-8") as f:
+        json.dump(best_spec_payload, f, indent=2)
+
+    print("\nArtefactos persistidos:")
+    print(f"  - {RESULTS_DIR / 'egarch_x_qlike_grid_search.csv'}")
+    print(f"  - {RESULTS_DIR / 'egarch_x_grid_predictions.parquet'}")
+    print(f"  - {RESULTS_DIR / 'egarch_x_best_params_by_fold.csv'}")
+    print(f"  - {RESULTS_DIR / 'egarch_x_best_spec.json'}")
 
     return best_model
+
 
 if __name__ == "__main__":
     find_optimal_egarch_x_by_qlike()

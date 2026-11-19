@@ -11,6 +11,8 @@ PROC_DIR = ROOT / "data" / "processed"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 PROC_DIR.mkdir(parents=True, exist_ok=True)
 
+PHASE_A_END_DATE = "2025-12-25"
+
 
 def _download_clean_ohlcv(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     """Descarga OHLCV desde yfinance, elimina duplicados y normaliza índice sin zona horaria."""
@@ -30,6 +32,9 @@ def _download_clean_ohlcv(ticker: str, start_date: str, end_date: str) -> pd.Dat
 
 
 def build_datasets(start_date: str = "2016-01-01", end_date: str = "2026-11-01") -> pd.DataFrame:
+    """
+    Construye el dataset procesado hasta el 2026-10-30 (end_date exclusivo en yfinance = 2026-11-01).
+    """
     tickers = {"BTC": "BTC-USD", "SPY": "SPY", "VIX": "^VIX"}
     raw_data = {
         name: _download_clean_ohlcv(ticker, start_date, end_date)
@@ -93,7 +98,7 @@ def build_datasets(start_date: str = "2016-01-01", end_date: str = "2026-11-01")
     dataset = dataset.dropna().sort_index()
     dataset.index.name = "Date"
 
-    # Orden canónico estricto: 10 features + 1 target (sin columnas extra)
+    # Orden canónico estricto: 10 features + 1 target
     feature_cols = [
         "BTC_r_oc", "BTC_r_ho", "BTC_r_lo", "BTC_r_vol",
         "SPY_r_oc", "SPY_r_ho", "SPY_r_lo", "SPY_r_vol", "SPY_r_overnight",
@@ -142,12 +147,18 @@ def build_datasets(start_date: str = "2016-01-01", end_date: str = "2026-11-01")
     dataset.to_csv(out_path, index_label="Date")
     ref_df.to_csv(ref_path, index_label="Date")
 
+    phase_a_df = dataset.loc[:PHASE_A_END_DATE]
+    phase_b_df = dataset.loc[pd.Timestamp(PHASE_A_END_DATE) + pd.Timedelta(days=1) :]
+
     metadata = {
         "start_date_requested": start_date,
         "end_date_requested": end_date,
         "actual_start_date": str(dataset.index.min().date()),
         "actual_end_date": str(dataset.index.max().date()),
+        "phase_a_end_date": PHASE_A_END_DATE,
         "total_observations": int(len(dataset)),
+        "phase_a_observations": int(len(phase_a_df)),
+        "phase_b_observations": int(len(phase_b_df)),
         "us_trading_days": int((~non_trading_days).sum()),
         "us_non_trading_days": int(non_trading_days.sum()),
         "feature_columns": feature_cols,
@@ -163,8 +174,9 @@ def build_datasets(start_date: str = "2016-01-01", end_date: str = "2026-11-01")
     print(f"Dataset procesado guardado en:  {out_path} | Shape: {dataset.shape}")
     print(f"Referencia retornos guardada:   {ref_path} | Shape: {ref_df.shape}")
     print(f"Metadatos guardados en:         {meta_path}")
-    print("\nVerificación Viernes-Lunes (Enero 2020):")
-    print(dataset.loc["2020-01-03":"2020-01-06", ["SPY_r_oc", "SPY_r_overnight", "VIX_log", "target_r2_t1"]])
+    print(f"Rango total: {metadata['actual_start_date']} -> {metadata['actual_end_date']} "
+          f"(Fase A <= {PHASE_A_END_DATE}: {metadata['phase_a_observations']} obs | "
+          f"Fase B Ciego 2026: {metadata['phase_b_observations']} obs)")
     return dataset
 
 

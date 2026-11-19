@@ -1,0 +1,15 @@
+{
+  "spec": "EGARCH(2,3)-X_GED",
+  "p": 2,
+  "o": 1,
+  "q": 3,
+  "dist": "ged",
+  "exog_cols": [
+    "SPY_r_oc",
+    "SPY_r_vol",
+    "SPY_r_overnight",
+    "VIX_log"
+  ],
+  "phase_a_mean_qlike": 1.8851344363865434,
+  "phase_a_median_qlike": 1.1159655610256987
+}

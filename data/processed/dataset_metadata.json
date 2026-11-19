@@ -3,7 +3,10 @@
   "end_date_requested": "2026-11-01",
   "actual_start_date": "2016-01-04",
   "actual_end_date": "2026-10-30",
+  "phase_a_end_date": "2025-12-25",
   "total_observations": 3953,
+  "phase_a_observations": 3644,
+  "phase_b_observations": 309,
   "us_trading_days": 2723,
   "us_non_trading_days": 1230,
   "feature_columns": [
