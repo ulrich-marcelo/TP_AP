@@ -158,9 +158,9 @@ def analyze_regimes_and_conditional_dm(panel: pd.DataFrame, model_list: list, eg
     p85_vix = float(np.percentile(vix_a, 85))
 
     regimes = [
-        ("1_Calma (< P50)", panel["y_true"] < p50_y),
-        ("2_Normal (P50 - P90)", (panel["y_true"] >= p50_y) & (panel["y_true"] < p90_y)),
-        ("3_Turbulencia_Alta (P90 - P98)", (panel["y_true"] >= p90_y) & (panel["y_true"] < p98_y)),
+        ("1_Baja_Volatilidad (< P50)", panel["y_true"] < p50_y),
+        ("2_Volatilidad_Moderada (P50 - P90)", (panel["y_true"] >= p50_y) & (panel["y_true"] < p90_y)),
+        ("3_Alta_Volatilidad (P90 - P98)", (panel["y_true"] >= p90_y) & (panel["y_true"] < p98_y)),
         ("4_Estres_Extremo (> P98)", panel["y_true"] >= p98_y),
         ("5_Crash_Severo (r < 0 & y >= P90)", (panel["y_true"] >= p90_y) & (panel["r_t1"] < 0)),
         ("6_Rally_Explosivo (r >= 0 & y >= P90)", (panel["y_true"] >= p90_y) & (panel["r_t1"] >= 0)),
@@ -185,7 +185,6 @@ def analyze_regimes_and_conditional_dm(panel: pd.DataFrame, model_list: list, eg
             win_vs_ged = float(np.mean(q_m < q_ged) * 100.0) if m != "EGARCH(1,3)_GED" else 50.0
             win_vs_x = float(np.mean(q_m < q_x) * 100.0) if m != egarch_x_name else 50.0
 
-            # Test DM condicional vs EGARCH(1,3)_GED y vs EGARCH-X
             if m != "EGARCH(1,3)_GED":
                 dm_ged = diebold_mariano_full(q_ged, q_m, h=1)
                 dm_stat_ged = dm_ged["dm_stat"]
@@ -308,20 +307,22 @@ def plot_stress_regimes_and_residuals(
     df_shocks: pd.DataFrame,
     egarch_x_name: str,
 ):
-    # --------------------------------------------------------------------------
-    # FIGURA 5: Superioridad en Estrés Extremo y Contención en Top-8 Crashes
-    # --------------------------------------------------------------------------
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, 5.8), gridspec_kw={"width_ratios": [1.15, 1.25]})
 
-    # Panel A: Error medio QLIKE en regímenes de turbulencia y estrés extremo
     target_regs = [
-        "1_Calma (< P50)",
-        "2_Normal (P50 - P90)",
-        "3_Turbulencia_Alta (P90 - P98)",
+        "1_Baja_Volatilidad (< P50)",
+        "2_Volatilidad_Moderada (P50 - P90)",
+        "3_Alta_Volatilidad (P90 - P98)",
         "4_Estres_Extremo (> P98)",
         "8_Test_Ciego_2026 (Fase B)",
     ]
-    short_labels = ["Calma\n(<P50)", "Normal\n(P50–P90)", "Turbulencia\n(P90–P98)", "Estrés Extremo\n(>P98)", "Test Ciego\n2026"]
+    short_labels = [
+        "Baja Vol.\n(<P50)",
+        "Vol. Moderada\n(P50–P90)",
+        "Alta Vol.\n(P90–P98)",
+        "Estrés Extremo\n(>P98)",
+        "Test Ciego\n2026",
+    ]
 
     models_to_plot = [
         ("EGARCH(1,3)_GED", "#d62728"),
@@ -344,10 +345,9 @@ def plot_stress_regimes_and_residuals(
     ax1.set_xticks(x)
     ax1.set_xticklabels(short_labels, fontsize=9.5)
     ax1.set_ylabel("Mean QLIKE (menor = mejor)")
-    ax1.set_title("A. Desempeño por Régimen de Mercado\n(Ventaja Estructural de DL en Estrés Extremo > P98)")
+    ax1.set_title("A. Desempeño por Régimen de Volatilidad\n(Ventaja Estructural de DL en Estrés Extremo > P98)")
     ax1.legend(loc="upper left", frameon=True, fontsize=8.5)
 
-    # Panel B: Pérdida QLIKE puntual en los Top-8 peores shocks históricos
     top8 = df_shocks.head(8).copy()
     x8 = np.arange(len(top8))
     w8 = 0.22
@@ -367,9 +367,6 @@ def plot_stress_regimes_and_residuals(
     fig.savefig(FIG_DIR / "fig5_regime_stress_superiority.png")
     plt.close(fig)
 
-    # --------------------------------------------------------------------------
-    # FIGURA 6: Correlograma ACF de Residuos Estandarizados al Cuadrado z_{t+1}^2
-    # --------------------------------------------------------------------------
     fig, ax = plt.subplots(figsize=(12.5, 5.2))
     r_t1 = panel["r_t1"].values
     max_lag = 25
