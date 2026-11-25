@@ -1,36 +1,58 @@
-# Modelado y Predicción de la Varianza Diaria de Bitcoin mediante Aprendizaje Profundo (2016-2026)
+# Modelado y Predicción de la Varianza Condicional Diaria de Bitcoin (2016–2026)
 
+**Un enfoque comparativo entre Arquitecturas de Aprendizaje Profundo y Econometría Clásica**
 
+Este repositorio contiene el código fuente, los pipelines de preprocesamiento, la configuración experimental y los artefactos reproducibles del Trabajo Práctico Final de la materia **Aprendizaje Profundo** (Licenciatura en Ciencia de Datos, ECyT - UNSAM).
 
-Este repositorio contiene el código fuente, canalizaciones de datos y configuración experimental del Trabajo Final de la materia **Aprendizaje Profundo**. El proyecto modela y predice la varianza condicional diaria de Bitcoin (BTC) para el período 2016-2026 utilizando redes neuronales profundas (GRU, LSTM y CNN 1D) frente a un modelo econométrico de referencia $EGARCH(1,3)\_GED$.
+El proyecto modela y evalúa fuera de muestra la varianza condicional diaria de Bitcoin (`BTC`) durante el período **2016–2026** ($3.953$ observaciones diarias), utilizando el **retorno logarítmico diario al cuadrado ($r_{\text{BTC}, t+1}^2$)** como proxy empírico no sesgado de la volatilidad latente. Se contrastan tres familias de redes neuronales profundas (**CNN 1D**, **GRU** y **LSTM**) alimentadas con un tensor estacionario de 10 canales endógenos y exógenos frente a tres modelos de referencia:
 
-A diferencia de los enfoques convencionales centrados en predecir el precio nominal —afectados por falta de estacionariedad y dependencia de escala—, el objetivo es predecir la volatilidad empleando el **retorno logarítmico diario al cuadrado ($r_{BTC, t+1}^2$)** como proxy observable no sesgado.
+* `Benchmark_Promedio`: varianza incondicional móvil sobre la ventana de entrenamiento (modelo nulo).
+* `EGARCH(1,3)_GED`: modelo econométrico heterocedástico univariado con errores GED.
+* `EGARCH(2,3)-X_GED`: extensión econométrica multivariada con covariables exógenas en la ecuación de log-varianza.
 
 ---
 
-## 1. Estructura del Proyecto
+## 1. Estructura del Repositorio
 
 ```text
 ├── data/
 │   ├── raw/
-│   │   └── raw_data.csv               # Cotizaciones históricas descargadas (BTC, SPY, VIX)
+│   │   └── raw_data.csv                           # Series históricas OHLCV descargadas (BTC-USD, SPY, ^VIX)
 │   └── processed/
-│       └── processed_data.csv         # Tensor de 10 canales estacionarios + variable objetivo
-├── notebooks/ (o scripts/)
-│   └── data_builder.ipynb             # Inspección exploratoria y gráficos de no estacionariedad
+│       ├── processed_data.csv                     # Tensor estacionario de 10 canales + target_r2_t1 (3.953 filas)
+│       ├── returns_reference.csv                  # Retornos exactos close-to-close (BTC_r_cc) para EGARCH y residuos
+│       └── dataset_metadata.json                  # Metadatos de cobertura temporal y alineación de calendarios
+├── notebooks/
+│   └── baseline.ipynb                             # Exploración inicial de modelos de referencia
 ├── scripts/
-│   ├── data_builder.py                # Pipeline ETL para descarga y cálculo de features
-│   ├── run_sweep_gru.py               # Optimización bayesiana en W&B para arquitectura GRU
-│   ├── run_sweep_lstm.py              # Optimización bayesiana en W&B para arquitectura LSTM
-│   └── run_sweep_cnn.py               # Optimización bayesiana en W&B para arquitectura CNN 1D
+│   ├── 1_data_builder.py                          # Descarga desde Yahoo Finance, alineación de calendarios y features
+│   ├── 2_eda_regression.py                        # EDA en Fase A: ADF/KPSS, ACF, Pearson/Spearman/IM, VIF, OLS (HC3)
+│   ├── 3_tune_egarch_x.py                         # Búsqueda en grilla de EGARCH-X en Fase A (minimización de QLIKE)
+│   ├── 4_evaluate_baselines.py                    # Evaluación Walk-Forward (16 folds) de los 3 modelos de referencia
+│   ├── 5_run_sweep_cnn.py                         # Sweep bayesiano en W&B para CNN 1D (40 corridas, solo Fase A)
+│   ├── 6_run_sweep_gru.py                         # Sweep bayesiano en W&B para GRU (40 corridas, solo Fase A)
+│   ├── 7_run_sweep_lstm.py                        # Sweep bayesiano en W&B para LSTM (40 corridas, solo Fase A)
+│   ├── 8_run_experiments_seeds.py                 # Selección dual 2+2, reentrenamiento en 5 semillas y ensambles
+│   ├── 9_compare_dl_vs_baselines.py               # Métricas consolidadas, Diebold-Mariano (HLN + HAC NW) y gráficos
+│   ├── 10_error_analysis_and_diagnostics.py       # Análisis por regímenes, Top-15 shocks y residuos estandarizados
+│   ├── 11_prediction_plots.py                     # Generación de figuras individuales de publicación (300 DPI)
+│   └── baseline_egarch.py                         # Script auxiliar de inspección de parámetros de EGARCH(1,3)_GED
 ├── src/
-│   ├── __init__.py                    # Inicialización del módulo y exportación de clases
-│   ├── data_loader.py                 # Carga de tensores y división X, y
-│   ├── models.py                      # Definición de arquitecturas (VolatilidadGRU, LSTM, CNN)
-│   └── trainer.py                     # Loss QLIKE, Walk-Forward, Early Stopping y soporte CUDA
-├── requirements.txt                   # Dependencias del entorno virtual
-└── README.md                          # Documentación del proyecto
-
+│   ├── __init__.py                                # API pública del paquete src
+│   ├── data_loader.py                             # Carga validada de tensores, retornos y corte estricto Fase A/B
+│   ├── econometrics.py                            # Implementación MLE y pronóstico recursivo h=1 de EGARCH-X
+│   ├── evaluation.py                              # QLIKE vectorizado, Diebold-Mariano (HLN/HAC) y contrato temporal
+│   ├── models.py                                  # Arquitecturas PyTorch: VolatilidadCNN, VolatilidadGRU, VolatilidadLSTM
+│   └── trainer.py                                 # QLIKELoss en log-varianza, Walk-Forward causal y Early Stopping
+├── results/
+│   ├── eda/                                       # Tablas CSV del diagnóstico exploratorio en Fase A
+│   ├── sweeps/                                    # Respaldos locales de las 120 corridas bayesianas de W&B
+│   ├── figures/                                   # Gráficos comparativos y subcarpeta report_individual/ (00 a 08)
+│   ├── selected_top4_configs_phase_a.{csv,json}   # 12 configuraciones congeladas al cierre de Fase A
+│   ├── *.parquet                                  # Predicciones diarias alineadas (baselines, semillas y ensambles)
+│   └── *.csv / *.json                             # Resúmenes QLIKE, tests DM/HAC, regímenes, residuos e historiales
+├── requirements.txt                               # Dependencias exactas del entorno virtual
+└── README.md                                      # Documentación del proyecto
 ```
 
 ---
@@ -40,257 +62,134 @@ A diferencia de los enfoques convencionales centrados en predecir el precio nomi
 ### 2.1 Clonar el repositorio y crear entorno virtual
 
 ```bash
-git clone https://github.com/ulrich-marcelo/tp_ap.git
+git clone [https://github.com/ulrich-marcelo/tp_ap.git](https://github.com/ulrich-marcelo/tp_ap.git)
 cd tp_ap
 
-# Crear y activar entorno virtual
-python -m venv venv
-source venv/bin/activate        # En Linux/macOS
-# .\venv\Scripts\activate       # En Windows
-
+python -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+# .\.venv\Scripts\activate       # Windows
 ```
 
-### 2.2 Instalación de Dependencias
-
-Para instalar las dependencias básicas:
+### 2.2 Instalación de dependencias
 
 ```bash
 pip install -r requirements.txt
-
 ```
 
 ### 2.3 Aceleración por Hardware (CUDA / GPU)
 
-Para entrenar en placas de video NVIDIA, se debe instalar la rueda oficial de PyTorch compilada con soporte CUDA (en lugar de la versión pura de CPU).
+Para entrenar los *sweeps* y el experimento multisemilla en GPU NVIDIA, verificar previamente el driver (`nvidia-smi`) e instalar la rueda oficial de PyTorch correspondiente a la versión de CUDA instalada desde [pytorch.org](https://pytorch.org/get-started/locally/). Comprobación rápida:
 
-1. Verificar que el controlador NVIDIA esté activo en la máquina:
 ```bash
-nvidia-smi
-
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), '| Dispositivo:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 ```
 
-
-2. Instalar la versión de PyTorch adecuada según la versión máxima de CUDA soportada por el driver:
-* **Para CUDA 12.x:**
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-```
-
-
-* **Para CUDA 11.8:**
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-
-```
-
-
-
-
-3. Comprobar la detección del dispositivo:
-```bash
-python -c "import torch; print('CUDA disponible:', torch.cuda.is_available()); print('Dispositivo:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-
-```
-
-
-
-El pipeline de `src/trainer.py` detectará automáticamente `torch.cuda.is_available()`, migrando los tensores y modelos a la VRAM con `pin_memory=True` y `non_blocking=True`.
+El módulo `src/trainer.py` detecta automáticamente `torch.cuda.is_available()`, fijando semillas determinísticas y habilitando `pin_memory=True` y transferencias `non_blocking=True`. Los scripts de EDA, baselines, evaluación estadística y generación de figuras corren íntegramente en CPU.
 
 ---
 
-## 3. Pipeline de Datos y Espacio de Características
+## 3. Dataset, Espacio de Características y Alineación de Calendarios
 
-El espacio de características multivariado comprende 10 canales continuos rigurosamente estacionarios más la variable objetivo, abarcando desde 2016 hasta 2026:
+El dataset abarca desde el **4 de enero de 2016** hasta el **30 de octubre de 2026** ($3.953$ observaciones diarias), particionado de forma estrictamente causal en dos fases mediante `PHASE_A_END_DATE = "2025-12-24"` en `src/data_loader.py`:
 
-* **Variable Objetivo (`target_r2_t1`)**:
+* **Fase A (Selección y Desarrollo):** `2016-01-04` a `2025-12-24` ($3.643$ observaciones totales; $1.095$ días iniciales de ajuste + $14$ pliegues fuera de muestra = **$2.548$ días OOS**). Es la única partición visible para EDA, grilla de `EGARCH-X` y *sweeps* bayesianos.
+* **Fase B (Test Ciego 2026):** `2025-12-25` a `2026-10-30` ($2$ pliegues fuera de muestra = **$310$ días OOS**). Permanece congelada durante todo el diseño experimental.
+* **Muestra Completa Out-of-Sample:** $16$ pliegues concatenados (**$T = 2.858$ días**, 2019–2026).
 
-$$r_{BTC,t} = \ln\left(\frac{C_t}{C_{t-1}}\right) \implies y_t = r_{BTC, t+1}^2$$
+### Variable objetivo y 10 canales estacionarios
 
+* **Target (`target_r2_t1`):** $y_t = r_{\text{BTC}, t+1}^2$, con $r_{\text{BTC}, t} = \ln(C_t / C_{t-1})$.
+* **Canales endógenos de Bitcoin (4):** variaciones intradiarias ancladas a la apertura `BTC_r_oc` ($\ln(C_t/O_t)$), `BTC_r_ho` ($\ln(H_t/O_t)$), `BTC_r_lo` ($\ln(L_t/O_t)$) y variación logarítmica de volumen `BTC_r_vol` ($\ln(V_t/V_{t-1})$).
+* **Canales exógenos del S&P 500 / SPY (5):** `SPY_r_oc`, `SPY_r_ho`, `SPY_r_lo`, `SPY_r_vol` y retorno fuera de horario `SPY_r_overnight` ($\ln(O_t/C_{t-1})$).
+* **Canal exógeno de estrés macro (1):** `VIX_log` ($\ln(\text{VIX}_t)$).
 
+### Tratamiento estructural de fines de semana y feriados
 
-* **Canales Endógenos de Bitcoin (4 canales)**:
+Para preservar el calendario continuo $24/7$ de Bitcoin ($2.723$ días hábiles NYSE y $1.230$ jornadas sin rueda) sin inyectar actividad bursátil ficticia, el pipeline distingue entre **variables de flujo** y **variables de estado**:
 
+* **Canales de flujo de SPY (5 canales):** se calculan exclusivamente sobre los $2.723$ días hábiles *antes* del cruce temporal (`left join`) con Bitcoin y se imputan con **`0.0` estricto** en los $1.230$ días sin rueda bursátil. El salto acumulado durante el cierre se absorbe íntegramente en `SPY_r_overnight` al reabrir el mercado.
+* **Variable de estado (`VIX_log`):** se propaga hacia adelante (`ffill`) desde el último cierre hábil disponible, manteniendo continuo el régimen de volatilidad implícita esperada.
 
-* `BTC_r_oc`: Retorno Open-to-Close $\ln(C_t / O_t)$
+---
 
-* `BTC_r_ho`: Amplitud Máxima $\ln(H_t / O_t)$
+## 4. Diseño Arquitectónico y Protocolo Experimental
 
-* `BTC_r_lo`: Amplitud Mínima $\ln(L_t / O_t)$
+### 4.1 Parametrización en Log-Varianza y Pérdida QLIKE
 
-* `BTC_r_vol`: Variación del Volumen $\ln(V_t / V_{t-1})$
+Las tres familias culminan en una proyección lineal sin restricción de signo (`nn.Linear(d, 1)`) inicializada con sesgo informativo $b_0 = -6.5$ ($\hat{\sigma}_0^2 \approx 1.50 \times 10^{-3}$), que predice directamente la log-varianza $\hat{\eta}_t \in \mathbb{R}$. La conversión a varianza estrictamente positiva se integra dentro de `QLIKELoss`:
 
+$$\hat{\sigma}_{t+1}^2 = \max\!\left(\exp(\operatorname{clip}(\hat{\eta}_t, -20, 15)),\, 10^{-6}\right), \qquad \mathcal{L}_{\text{QLIKE}}(y_t, \hat{\sigma}_{t+1}^2) = \frac{y_t}{\hat{\sigma}_{t+1}^2} - \ln\!\left(\frac{y_t}{\hat{\sigma}_{t+1}^2}\right) - 1$$
 
+Esta reparametrización vuelve al gradiente invariante a la escala ($\partial \mathcal{L} / \partial \hat{\eta}_t = 1 - y_t / \hat{\sigma}_{t+1}^2$) y se combina con acotamiento de norma de gradiente (`clip_grad_norm_` con umbral `1.0`). Tanto el target como todas las predicciones (econométricas y neuronales) se evalúan en escala decimal con piso común $\epsilon = 10^{-6}$.
 
-* **Canales Exógenos del S&P 500 / SPY (5 canales)**:
+### 4.2 Familias de Arquitecturas (`src/models.py`)
 
+| Familia | Clase PyTorch | Mecanismo Temporal sobre Ventana Finita $W$ | Parámetros ($H=32, L=1$) |
+| :--- | :--- | :--- | :---: |
+| **CNN 1D** | `VolatilidadCNN` | Convolución 1D con kernels impares $K \in \{3, 5, 7\}$, *padding* simétrico, activación `GELU` y `AdaptiveAvgPool1d(2)` | `1.697` ($K=5$) |
+| **GRU** | `VolatilidadGRU` | Red recurrente *stateless* con 2 compuertas ($z_\tau, r_\tau$) y memoria truncada al horizonte $W$ | `4.257` |
+| **LSTM** | `VolatilidadLSTM` | Red recurrente *stateless* con celda aditiva y 3 compuertas ($f_\tau, i_\tau, o_\tau$) sobre ventana $W$ | `5.665` |
 
-* `SPY_r_oc`, `SPY_r_ho`, `SPY_r_lo`, `SPY_r_vol`
+### 4.3 Walk-Forward Causal, Sweeps Bayesianos y Ensambles Jerárquicos
 
-* `SPY_r_overnight`: Retorno nocturno y fin de semana $\ln(O_t / C_{t-1})$
+* **Ventana móvil fija de $1.095$ días (3 años) con paso semestral de $182$ días** ($128$ días en el Pliegue 15): dentro de cada pliegue, los primeros **$1.005$ días** ajustan el `RobustScaler` y entrenan pesos con `AdamW` (hasta 45 épocas), mientras los **$90$ días** posteriores actúan como validación interna aislada para *Early Stopping* (paciencia $= 10$, $\Delta = 10^{-4}$). Para no perder el arranque de cada bloque, se antepone un contexto causal (`features_context`) de los últimos $W-1$ días escalados del bloque previo.
+* **Búsqueda bayesiana en Fase A:** 40 corridas por familia ($120$ totales) en Weights & Biases minimizando `avg_cross_val_loss` (`val_mean_qlike`) sobre `timesteps` ($W \in \{5, 7, 14, 21\}$), `hidden_size` ($H \in \{16, 24, 32\}$), `num_layers` ($L \in \{1, 2\}$), `kernel_size` ($K \in \{3, 5, 7\}$ para CNN), `dropout_rate` ($\{0.2, 0.3, 0.4, 0.5\}$), `batch_size` ($\{16, 32, 64\}$), `learning_rate` ($\text{Log-U}[3\times 10^{-4}, 3\times 10^{-3}]$) y `weight_decay` ($\text{Log-U}[10^{-5}, 10^{-2}]$).
+* **Selección dual $2+2$ y experimento multisemilla:** tras exigir superar al `Benchmark_Promedio` en Fase A ($\text{QLIKE medio} \le 1.9623$), se congelan 4 configuraciones disjuntas por familia (`MeanTop1/2` + `MedTop1/2` = 12 configuraciones) y se reentrenan desde cero en los 16 pliegues sobre 5 semillas independientes (`[42, 123, 456, 789, 7122001]`), promediando predicciones en espacio de varianza para conformar ensambles de ablación (`Mean_Top2`, `Median_Top2`), híbridos por familia (`Hybrid_2x2`, 20 modelos) y el super-ensamble global (`DL_SuperEnsemble_60M`, 60 modelos).
 
+---
 
+## 5. Orden de Ejecución Reproducible
 
-* **Canal Exógeno de Estrés Macro (1 canal)**:
-
-
-* `VIX_log`: Transformación logarítmica del índice VIX $\ln(VIX_t)$
-
-
-
-
-Para reconstruir el conjunto de datos crudo y procesado:
+Ejecutar los scripts desde la raíz del repositorio en la siguiente secuencia:
 
 ```bash
-python scripts/data_builder.py
+# 1. Ingesta, alineación temporal y generación del dataset procesado
+python scripts/1_data_builder.py
 
-```
+# 2. Análisis exploratorio y diagnóstico lineal/no lineal (estrictamente sobre Fase A)
+python scripts/2_eda_regression.py
 
-Los días no operativos de los mercados tradicionales (sábados, domingos y feriados) se alinean contra el calendario ininterrumpido 24/7/365 de Bitcoin mediante propagación del último valor conocido (`ffill`).
+# 3. Selección de especificación EGARCH-X en Fase A y evaluación de los 3 baselines (16 folds)
+python scripts/3_tune_egarch_x.py
+python scripts/4_evaluate_baselines.py
 
----
-
-## 4. Metodología de Modelado y Entrenamiento
-
-### 4.1 Función de Pérdida Asimétrica (QLIKE)
-
-Durante la optimización se minimiza la función de pérdida cuasi-verosímil QLIKE:
-
-
-$$QLIKE(y, \hat{\sigma}^2) = \frac{y}{\hat{\sigma}^2} - \ln\left(\frac{y}{\hat{\sigma}^2}\right) - 1$$
-
-
-En concordancia con los modelos de la familia EGARCH:
-
-* Las redes neuronales predicen directamente el logaritmo de la varianza condicional: $h_{pred} = \ln(\hat{\sigma}^2)$.
-
-
-* La clase `QLIKELoss` en `src/trainer.py` transforma la predicción mediante $\hat{\sigma}^2 = \exp(h_{pred})$ y aplica un suelo numérico `torch.clamp(min=1e-6)` para garantizar positividad estricta sin inestabilidad de gradientes.
-
-
-
-### 4.2 Validación Temporal: Walk-Forward (Ventana Deslizante)
-
-Para impedir la filtración de información futura (*data leakage*), se utiliza una partición secuencial con ventana deslizante:
-
-* **Ventana de entrenamiento fija**: 3 años (1095 días).
-
-
-* **Ventana de validación *out-of-sample***: 1 año (365 días).
-
-
-* **Estandarización aislada**: Se ajusta dinámicamente un `RobustScaler()` sobre el conjunto de entrenamiento de cada fold y se transforma tanto el entrenamiento como la ventana de validación correspondiente.
-
-
-* El esquema genera 7 folds secuenciales cubriendo de 2016 a fines de 2025.
-
-
-
-### 4.3 Regularización y Early Stopping
-
-Dado el tamaño crítico de la serie (~3.500 observaciones):
-
-* Se imponen celdas de capacidad reducida (16 a 32 unidades/filtros).
-
-
-* Capas de Dropout agresivas (0.2 a 0.5).
-
-
-* Optimizador `AdamW` con decaimiento de pesos (*weight decay*) desacoplado.
-
-
-* Criterio de parada temprana (**Early Stopping** con paciencia de 10 épocas y umbral $\Delta = 10^{-4}$) para prevenir la memorización del ruido estocástico financiero.
-
----
-
-## 5. Arquitecturas Disponibles
-
-| Arquitectura | Clase en `src/models.py` | Tipo de Sistema Dinámico | Características
-
- |
-| --- | --- | --- | --- |
-| **GRU** | `VolatilidadGRU`<br> | Respuesta Infinita (2 compuertas)
-
- | Eficiencia paramétrica y menor varianza muestral.
-
- |
-| **LSTM** | `VolatilidadLSTM` | Respuesta Infinita (3 compuertas)
-
- | Celda de estado aditiva para dependencias temporales largas.
-
- |
-| **CNN 1D** | `VolatilidadCNN` | Respuesta Finita (Filtros locales)
-
- | Extracción convolucional de patrones de shock y MaxPool temporal.
-
- |
-
----
-
-## 6. Ejecución de Sweeps con Weights & Biases (W&B)
-
-Para garantizar un *benchmarking* imparcial, cada familia arquitectónica dispone de su propio script de optimización bayesiana con un presupuesto equivalente de 40 corridas (`runs`).
-
-Antes de ejecutar, iniciar sesión en Weights & Biases:
-
-```bash
+# 4. Optimización bayesiana de hiperparámetros en Weights & Biases (solo Fase A)
 wandb login
+python scripts/5_run_sweep_cnn.py --count 40
+python scripts/6_run_sweep_gru.py --count 40
+python scripts/7_run_sweep_lstm.py --count 40
 
+# 5. Selección dual 2+2, entrenamiento multisemilla (60 trayectorias) y ensambles
+python scripts/8_run_experiments_seeds.py --select-only   # Inspección previa opcional
+python scripts/8_run_experiments_seeds.py
+
+# 6. Comparación estadística (Diebold-Mariano HLN + sensibilidad HAC Newey-West) y diagnósticos
+python scripts/9_compare_dl_vs_baselines.py
+python scripts/10_error_analysis_and_diagnostics.py
+
+# 7. Generación de figuras individuales del informe (results/figures/report_individual/)
+python scripts/11_prediction_plots.py
 ```
-
-### Ejecución individual por arquitectura
-
-* **Optimizar modelo GRU:**
-```bash
-python scripts/run_sweep_gru.py
-
-```
-
-
-* **Optimizar modelo LSTM:**
-```bash
-python scripts/run_sweep_lstm.py
-
-```
-
-
-* **Optimizar modelo CNN 1D:**
-```bash
-python scripts/run_sweep_cnn.py
-
-```
-
-
-
-### Espacio de Hiperparámetros Evaluado
-
-* `learning_rate`: Muestreo logarítmico continuo entre $3 \times 10^{-4}$ y $3 \times 10^{-3}$.
-* `weight_decay`: Muestreo logarítmico continuo entre $1 \times 10^{-5}$ y $1 \times 10^{-2}$.
-* `hidden_size`: $\{16, 24, 32\}$ unidades / filtros.
-
-
-* `dropout_rate`: $\{0.2, 0.3, 0.4, 0.5\}$.
-
-
-* `timesteps`: $\{5, 7, 14, 21\}$ días históricos.
-* `batch_size`: $\{16, 32, 64\}$.
 
 ---
 
-## 7. Comparación de Resultados y Evaluación Estadística
+## 6. Síntesis de Resultados Principales
 
-El objetivo metodológico es contrastar las arquitecturas frente al modelo base de la econometría clásica obtenido bajo la misma metodología de validación:
+### Desempeño Out-of-Sample Consolidado (QLIKE)
 
-* **Baseline Econométrico ($EGARCH(1,3)\_GED$):** $\text{QLIKE} = \mathbf{1.831}$.
+| Modelo | Fase A ($T=2.548$) Mean / Median | Fase B Ciega 2026 ($T=310$) Mean / Median | Muestra Completa ($T=2.858$) Mean / Median | Win-Rate vs. `EGARCH_GED` (Completa) |
+| :--- | :---: | :---: | :---: | :---: |
+| `Benchmark_Promedio` | `1.9623` / `1.2758` | `1.8823` / `1.1332` | `1.9537` / `1.2587` | `31.67%` |
+| `EGARCH(1,3)_GED` | `1.9025` / `1.1126` | `1.7948` / `0.9934` | `1.8908` / `1.1069` | `50.00%` |
+| `EGARCH(2,3)-X_GED` | `1.8851` / `1.1160` | **`1.7613`** / `1.0809` | `1.8717` / `1.1129` | `46.22%` |
+| `CNN_1D_Hybrid_2x2` | `1.8893` / `1.1765` | `1.7710` / `1.0516` | `1.8765` / `1.1646` | `42.93%` |
+| `GRU_Hybrid_2x2` | `1.8390` / **`1.1064`** | `1.7787` / **`0.9702`** | `1.8325` / **`1.0841`** | `48.99%` |
+| `LSTM_Hybrid_2x2` | **`1.8328`** / `1.1077` | `1.7886` / `0.9777` | **`1.8280`** / `1.0942` | **`50.07%`** |
+| `DL_SuperEnsemble_60M` | `1.8436` / `1.1356` | `1.7648` / `1.0164` | `1.8351` / `1.1184` | `46.61%` |
 
+### Hallazgos Estadísticos Clave (Test de Diebold-Mariano HLN 1997 + Sensibilidad HAC)
 
-* **Varianza Incondicional Constante (Benchmark Cero):** $\text{QLIKE} \approx \mathbf{2.074}$.
-* **Mejor Modelo Deep Learning (GRU Óptima):** $\text{QLIKE} \approx \mathbf{1.770}$.
-
-### Test de Significancia Estadística: Diebold-Mariano
-
-Para corroborar que la ventaja de la red neuronal sobre el modelo econométrico es estadísticamente significativa y no producto del ruido estocástico del proxy, se ejecuta el test de Diebold-Mariano (1995) con corrección de Harvey, Leybourne y Newbold (1997) bajo la función de pérdida robusta QLIKE:
-
-$$H_0: \mathbb{E}[QLIKE_{EGARCH, t} - QLIKE_{DL, t}] \le 0 \quad \text{vs.} \quad H_1: \mathbb{E}[QLIKE_{EGARCH, t} - QLIKE_{DL, t}] > 0$$
-
-Un valor de $p < 0.05$ confirma la superioridad predictiva out-of-sample de la arquitectura seleccionada sobre el estándar econométrico clásico.
+* **Rechazo de superioridad global del Deep Learning sobre `EGARCH(1,3)_GED`:** si bien todos los ensambles neuronales superan holgadamente al `Benchmark_Promedio` ($p_{\text{bilat.}} < 0.0001$), ninguna arquitectura supera estadísticamente al modelo econométrico univariado al 5% (`LSTM_Hybrid_2x2`: $p_{\text{bilat.}} = 0.1312$, $p_{\text{unilat.}} = 0.0656$; verificado sin cambios bajo HAC Newey-West con $L = \lfloor T^{1/3} \rfloor$: $p_{\text{bilat.}} = 0.1271$).
+* **Paridad en el Test Ciego 2026:** en un régimen de menor turbulencia, `EGARCH(2,3)-X_GED` (`1.7613`) y `DL_SuperEnsemble_60M` (`1.7648`) empatan estadísticamente ($p_{\text{bilat.}} = 0.9465$), mientras `GRU_Hybrid_2x2` lidera en mediana (`0.9702`) y *win-rate* diario (`60.65%`).
+* **Jerarquía interna y parsimonia:** dentro del aprendizaje profundo, las redes recurrentes superan significativamente a la CNN 1D (`GRU`: $p_{\text{bilat.}} = 0.0001$; `LSTM`: $p_{\text{bilat.}} = 0.0012$), mientras que GRU y LSTM empatan estadísticamente ($p_{\text{bilat.}} = 0.7066$) con 25% menos parámetros recurrentes en GRU.
+* **Fortalezas complementarias por régimen:** los modelos EGARCH dominan en baja volatilidad ($< P_{50}$) y eliminan por completo la autocorrelación ARCH residual ($p > 0.96$ en Ljung-Box y ARCH-LM sobre $z^2$), mientras que las redes neuronales superan significativamente a la econometría en volatilidad moderada ($P_{50}\text{--}P_{90}$, $p < 0.0003$), logran una calibración de varianza residual más cercana a $1$ ($\text{Var}(z) = 1.0140$ en LSTM) y reducen un **32.7%** el QLIKE medio en los 15 mayores shocks históricos.
