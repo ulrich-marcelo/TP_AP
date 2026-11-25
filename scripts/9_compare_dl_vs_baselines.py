@@ -161,7 +161,8 @@ def run_comprehensive_dm_tests(baselines: dict, dl_ensembles: dict, dl_candidate
 
         loss_b = merged["loss_base"].values
         loss_c = merged["loss_cand"].values
-        dm_res = diebold_mariano_full(loss_b, loss_c, h=1)
+        dm_res = diebold_mariano_full(loss_b, loss_c, h=1, hac_lags=None)
+        dm_nw = diebold_mariano_full(loss_b, loss_c, h=1, hac_lags="newey_west")
 
         T = dm_res["T"]
         diff_mean = dm_res["diff_mean"]
@@ -206,6 +207,14 @@ def run_comprehensive_dm_tests(baselines: dict, dl_ensembles: dict, dl_candidate
             "Signif_Unilateral": sig_one,
             "Veredicto_Bilateral": ver_two,
             "Veredicto_Unilateral": ver_one,
+            "ACF1_d": dm_res["acf1_d"],
+            "HAC_Lags_NW": dm_nw["hac_lags_used"],
+            "Error_Estandar_NW": dm_nw["se_hac"],
+            "DM_Stat_NW": dm_nw["dm_stat"],
+            "p_val_bilateral_NW": dm_nw["p_val_bilateral"],
+            "Signif_Bilateral_NW": get_significance_code(dm_nw["p_val_bilateral"]),
+            "p_val_unilateral_NW": dm_nw["p_val_unilateral"],
+            "Signif_Unilateral_NW": get_significance_code(dm_nw["p_val_unilateral"]),
         }
 
     for scope in phase_scopes:
@@ -264,6 +273,12 @@ def run_comprehensive_dm_tests(baselines: dict, dl_ensembles: dict, dl_candidate
     df_dm_blind = df_dm[df_dm["Fase"] == "Fase_B_Test_Ciego"].reset_index(drop=True)
     df_dm_blind.to_csv(RESULTS_DIR / "diebold_mariano_blind_test_2026.csv", index=False)
 
+    df_dm_hac = df_dm[
+        df_dm["Tipo_Contraste"].isin(["DL_Ensemble vs Baseline", "Inter-Baseline", "Inter-Arquitectura DL"])
+    ].reset_index(drop=True)
+    df_dm_hac.to_csv(RESULTS_DIR / "diebold_mariano_hac_sensitivity.csv", index=False)
+
+
     return df_dm
 
 
@@ -275,9 +290,13 @@ def build_overall_comparison_summary(baselines: dict, dl_ensembles: dict, egarch
     all_models = {}
     for k, v in baselines.items():
         all_models[k] = ("Baseline", v)
+    # Primero los principales (Hybrid_2x2 y SuperEnsemble), luego las 6 ablaciones
     for k, v in dl_ensembles.items():
         if k.endswith("Hybrid_2x2") or k == "DL_SuperEnsemble_60M":
             all_models[k] = ("Deep_Learning", v)
+    for k, v in dl_ensembles.items():
+        if k.endswith("Mean_Top2") or k.endswith("Median_Top2"):
+            all_models[k] = ("Deep_Learning_Ablacion", v)
 
     egarch_ref = baselines["EGARCH(1,3)_GED"][["Date", "phase", "qlike"]].rename(columns={"qlike": "qlike_egarch"})
 
@@ -518,6 +537,41 @@ def generate_comparative_plots(baselines: dict, dl_ensembles: dict, egarch_x_nam
     print(f"Figuras guardadas exitosamente en: {FIG_DIR.resolve()}")
 
 
+def audit_early_2019_jump(baselines: dict, dl_ensembles: dict, egarch_x_name: str, top_n: int = 10) -> pd.DataFrame:
+    """
+    Audita las jornadas del Pliegue 0 (2019-S1) que explican el salto inicial
+    en el diferencial acumulado de pérdida QLIKE (Figura 6).
+    """
+    ged = baselines["EGARCH(1,3)_GED"][["Date", "fold", "y_true", "sigma2_pred", "qlike"]].rename(
+        columns={"sigma2_pred": "s2_ged", "qlike": "q_ged"}
+    )
+    egx = baselines[egarch_x_name][["Date", "sigma2_pred", "qlike"]].rename(
+        columns={"sigma2_pred": "s2_x", "qlike": "q_x"}
+    )
+    sup = dl_ensembles["DL_SuperEnsemble_60M"][["Date", "sigma2_pred", "qlike"]].rename(
+        columns={"sigma2_pred": "s2_super", "qlike": "q_super"}
+    )
+
+    m = ged.merge(egx, on="Date").merge(sup, on="Date")
+    m = m[m["fold"] == 0].copy()
+    m["y_true_pct2"] = m["y_true"] * 10000.0
+    m["s2_ged_pct2"] = m["s2_ged"] * 10000.0
+    m["s2_x_pct2"] = m["s2_x"] * 10000.0
+    m["s2_super_pct2"] = m["s2_super"] * 10000.0
+    m["d_ged_super"] = m["q_ged"] - m["q_super"]
+    m["d_x_super"] = m["q_x"] - m["q_super"]
+
+    top_days = (
+        m.reindex(m["d_ged_super"].abs().sort_values(ascending=False).index)
+        .head(top_n)
+        [["Date", "y_true_pct2", "s2_ged_pct2", "s2_x_pct2", "s2_super_pct2",
+          "q_ged", "q_x", "q_super", "d_ged_super", "d_x_super"]]
+        .reset_index(drop=True)
+    )
+    top_days.to_csv(RESULTS_DIR / "audit_2019_jump_top10.csv", index=False)
+    return top_days
+
+
 def main():
     baselines, dl_ensembles, dl_candidates, egarch_x_name = load_all_models_data()
     df_dm = run_comprehensive_dm_tests(baselines, dl_ensembles, dl_candidates, egarch_x_name)
@@ -541,6 +595,30 @@ def main():
         "Diferencia_Media", "DM_Stat_HLN", "p_val_bilateral", "p_val_unilateral", "Signif_Unilateral",
     ]
     print(sub_dm[disp_cols].to_string(index=False))
+
+
+    df_jump = audit_early_2019_jump(baselines, dl_ensembles, egarch_x_name)
+
+    print("\n" + "=" * 125)
+    print("SENSIBILIDAD HAC NEWEY-WEST (MUESTRA COMPLETA Y FASE A — HYBRIDS + ABLACIONES VS BASELINES):")
+    print("=" * 125)
+    sub_hac = df_dm[
+        (df_dm["Fase"].isin(["Fase_A_Seleccion", "Muestra_Completa"]))
+        & (df_dm["Tipo_Contraste"] == "DL_Ensemble vs Baseline")
+        & (df_dm["Modelo_Base"].isin(["EGARCH(1,3)_GED", egarch_x_name]))
+    ]
+    hac_cols = [
+        "Fase", "Modelo_Base", "Modelo_Candidato", "Diferencia_Media",
+        "ACF1_d", "Error_Estandar_HAC", "p_val_bilateral", "p_val_unilateral",
+        "Error_Estandar_NW", "p_val_bilateral_NW", "p_val_unilateral_NW",
+    ]
+    print(sub_hac[hac_cols].to_string(index=False))
+
+    print("\n" + "=" * 125)
+    print("AUDITORÍA SALTO INICIAL 2019-S1 (TOP-10 DÍAS POR |d_t| EGARCH_GED vs SUPERENSEMBLE):")
+    print("=" * 125)
+    print(df_jump.to_string(index=False))
+
 
     print("\nArtefactos exportados:")
     print(f"  - {RESULTS_DIR / 'diebold_mariano_statistical_tests.csv'}")

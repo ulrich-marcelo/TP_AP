@@ -27,10 +27,16 @@ def get_significance_code(p_val: float) -> str:
     return "n.s."
 
 
-def diebold_mariano_full(loss_baseline, loss_candidate, h: int = 1) -> dict:
+def diebold_mariano_full(loss_baseline, loss_candidate, h: int = 1, hac_lags=None) -> dict:
     """
-    Test de Diebold-Mariano (1995) con estimador HAC de Newey-West (ponderador de Bartlett)
+    Test de Diebold-Mariano (1995) con estimador HAC de Newey-West (núcleo de Bartlett)
     y ajuste de muestra finita de Harvey, Leybourne y Newbold (1997).
+
+    Parámetros:
+        hac_lags:
+            - None (default): truncamiento canónico HLN en max_lag = h - 1.
+            - "newey_west": ancho de banda automático L = floor(T^(1/3)).
+            - int >= 0: número explícito de rezagos de Bartlett.
 
     Convención de signo:
         d_t = loss_baseline_t - loss_candidate_t
@@ -41,13 +47,28 @@ def diebold_mariano_full(loss_baseline, loss_candidate, h: int = 1) -> dict:
     if T == 0:
         raise ValueError("Los vectores de pérdida no pueden estar vacíos.")
 
-    mean_d = float(np.mean(d))
+    if hac_lags is None:
+        max_lag = max(int(h) - 1, 0)
+    elif isinstance(hac_lags, str) and hac_lags.lower().strip() == "newey_west":
+        max_lag = int(np.floor(T ** (1.0 / 3.0)))
+    else:
+        max_lag = max(int(hac_lags), 0)
+    max_lag = min(max_lag, max(T - 1, 0))
 
-    gamma0 = float(np.var(d, ddof=0))
+    mean_d = float(np.mean(d))
+    d_centered = d - mean_d
+
+    gamma0 = float(np.dot(d_centered, d_centered) / T)
+    acf1_d = (
+        float(np.dot(d_centered[1:], d_centered[:-1]) / (T * gamma0))
+        if (T > 1 and gamma0 > 1e-15)
+        else 0.0
+    )
+
     gamma_sum = 0.0
-    for k in range(1, h):
-        weight = 1.0 - (k / h)
-        cov_k = float(np.sum((d[k:] - mean_d) * (d[:-k] - mean_d)) / T)
+    for k in range(1, max_lag + 1):
+        weight = 1.0 - (k / (max_lag + 1.0))
+        cov_k = float(np.dot(d_centered[k:], d_centered[:-k]) / T)
         gamma_sum += 2.0 * weight * cov_k
 
     var_d = gamma0 + gamma_sum
@@ -63,6 +84,8 @@ def diebold_mariano_full(loss_baseline, loss_candidate, h: int = 1) -> dict:
             "dm_stat": 0.0,
             "p_val_bilateral": 1.0,
             "p_val_unilateral": 0.5,
+            "hac_lags_used": max_lag,
+            "acf1_d": acf1_d,
         }
 
     dm_stat = mean_d / se_d
@@ -81,12 +104,14 @@ def diebold_mariano_full(loss_baseline, loss_candidate, h: int = 1) -> dict:
         "dm_stat": dm_hln,
         "p_val_bilateral": p_val_two,
         "p_val_unilateral": p_val_one,
+        "hac_lags_used": max_lag,
+        "acf1_d": acf1_d,
     }
 
 
-def diebold_mariano_test(loss_baseline, loss_candidate, h: int = 1):
+def diebold_mariano_test(loss_baseline, loss_candidate, h: int = 1, hac_lags=None):
     """Wrapper compatible que retorna (dm_stat_HLN, p_val_bilateral)."""
-    res = diebold_mariano_full(loss_baseline, loss_candidate, h=h)
+    res = diebold_mariano_full(loss_baseline, loss_candidate, h=h, hac_lags=hac_lags)
     return res["dm_stat"], res["p_val_bilateral"]
 
 

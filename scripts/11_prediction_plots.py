@@ -158,19 +158,6 @@ def generate_eda_individual_plots():
                 ax2.grid(False)
                 lines = l1 + l2
 
-            btc_min, btc_max = float(btc_close.min()), float(btc_close.max())
-            ax1.annotate(
-                f"No estacionariedad fuerte (I(1)):\n"
-                f"• Rango BTC: ${btc_min:,.0f} → ${btc_max:,.0f} (>{btc_max/btc_min:.0f}×)\n"
-                f"• Un cambio de $1,000 equivale a ~100% en 2017\n"
-                f"  pero a <1% en 2025 (invarianza de escala rota).\n"
-                f"→ Solución: retornos logarítmicos r_t = ln(P_t / P_{{t-1}}).",
-                xy=(pd.Timestamp("2016-04-01"), btc_max * 0.50),
-                fontsize=9.6,
-                color="#1a2530",
-                bbox=dict(boxstyle="round,pad=0.35", facecolor="#f8f9fa", edgecolor="#1f77b4", alpha=0.95),
-            )
-
             labels = [l.get_label() for l in lines]
             ax1.legend(lines, labels, loc="upper left", frameon=True, fontsize=9.8)
             ax1.set_title(
@@ -218,14 +205,26 @@ def generate_eda_individual_plots():
     acf_r2 = acf(df["BTC_r_cc"].values ** 2, nlags=max_lag, fft=True)[1:]
     conf_band = 1.96 / np.sqrt(len(df))
 
-    w = 0.27
-    ax.bar(lags - w, acf_r, width=w, color="#7f7f7f", label=r"Retorno con signo $r_t$ (sin memoria)")
-    ax.bar(lags, acf_abs, width=w, color="#1f77b4", label=r"Módulo $|r_t|$ (señal EGARCH y entradas DL)")
-    ax.bar(lags + w, acf_r2, width=w, color="#d62728", label=r"Varianza realizada $r_t^2$ (efecto ARCH)")
+    w = 0.28
+    ax.bar(
+        lags - w, acf_r, width=w,
+        color="#1a1a1a", edgecolor="#000000", linewidth=0.35, zorder=3,
+        label=r"Retorno con signo $r_t$ (ruido blanco)",
+    )
+    ax.bar(
+        lags, acf_abs, width=w,
+        color="#1f77b4", alpha=0.88, zorder=2,
+        label=r"Módulo $|r_t|$ (señal EGARCH y entradas DL)",
+    )
+    ax.bar(
+        lags + w, acf_r2, width=w,
+        color="#d62728", alpha=0.88, zorder=2,
+        label=r"Varianza realizada $r_t^2$ (efecto ARCH)",
+    )
     ax.axhline(conf_band, color="black", ls="--", lw=1.1, label="Umbral ruido blanco (95%)")
     ax.axhline(-conf_band, color="black", ls="--", lw=1.1)
     ax.axhline(0, color="black", lw=0.7)
-    ax.set_xlabel("Rezago (días) — Justificación de ventanas de entrada de 7 a 21 días")
+    ax.set_xlabel("Rezago (días) — Justificación de ventanas de entrada de 5 a 21 días")
     ax.set_ylabel("Autocorrelación (ACF)")
     ax.set_title(
         "Memoria Temporal: Retornos Direccionales (Ruido Blanco)\n"
@@ -260,9 +259,11 @@ def generate_eda_individual_plots():
             bbox=dict(facecolor="white", edgecolor="none", alpha=0.80, pad=1.0),
         )
 
+    d1_val = float(nic.loc[0, "Target_r2_Media_pct2"])
     ax.axhline(mean_d2_d10, color="#333333", ls="--", lw=1.3, label=f"Promedio deciles D2–D10 ({mean_d2_d10:.1f} %²)")
     legend_patches = [
-        Patch(facecolor="#d62728", edgecolor="black", alpha=0.88, label="D1 — Desplomes severos: duplica la varianza futura (23.4 %²)"),
+        Patch(facecolor="#d62728", edgecolor="black", alpha=0.88,
+              label=f"D1 — Desplomes severos: duplica la varianza futura ({d1_val:.1f} %²)"),
         Patch(facecolor="#4c78a8", edgecolor="black", alpha=0.88, label="D2 a D10 — Resto de escenarios de mercado"),
         plt.Line2D([0], [0], color="#333333", ls="--", lw=1.3, label=f"Promedio D2–D10 ({mean_d2_d10:.1f} %²)"),
     ]
@@ -487,9 +488,9 @@ def generate_diagnostics_individual_plots():
             c_covid["Date"], 0, var_real_7d,
             color="#bdbdbd", alpha=0.38, label="Varianza realizada móvil 7d (%²)"
         )
-        ax.plot(c_covid["Date"], s2_ged_pct2, color="#d62728", lw=1.8, ls="--", label="EGARCH(1,3)_GED (sobrerreacción)")
+        ax.plot(c_covid["Date"], s2_ged_pct2, color="#d62728", lw=1.8, ls="--", label="EGARCH(1,3)_GED")
         ax.plot(c_covid["Date"], s2_x_pct2, color="#e7298a", lw=1.8, ls="-.", label=egarch_x_name)
-        ax.plot(c_covid["Date"], s2_super_pct2, color="#1f77b4", lw=2.3, label="DL SuperEnsemble (60M) (calibrada)")
+        ax.plot(c_covid["Date"], s2_super_pct2, color="#1f77b4", lw=2.3, label="DL SuperEnsemble (60M)")
 
     ax_top.set_ylim(215, 1720)
     ax_bot.set_ylim(-5, 195)

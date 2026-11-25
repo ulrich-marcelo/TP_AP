@@ -9,7 +9,7 @@ EXPECTED_FEATURE_COLS = [
     "VIX_log",
 ]
 TARGET_COL = "target_r2_t1"
-PHASE_A_END_DATE = "2025-12-25"
+PHASE_A_END_DATE = "2025-12-24"
 
 
 def _read_time_indexed_csv(filepath) -> pd.DataFrame:
@@ -39,7 +39,7 @@ def _apply_phase_filter(df: pd.DataFrame, phase: str) -> pd.DataFrame:
 def load_processed_data(filepath="../data/processed/processed_data.csv", phase: str = "all"):
     """
     Carga la matriz de características X (10 canales) y el vector objetivo y (r_{t+1}^2).
-    Con phase='phase_a', recorta estrictamente hasta PHASE_A_END_DATE (2025-12-25)
+    Con phase='phase_a', recorta estrictamente hasta PHASE_A_END_DATE (2025-12-24)
     para evitar cualquier filtración del test ciego de 2026 durante sweeps o tuning.
     """
     _, X, y, _, _ = load_processed_data_with_dates(filepath=filepath, phase=phase)

@@ -248,6 +248,10 @@ def analyze_nonlinearity_and_ols(df_full: pd.DataFrame, X: np.ndarray, y: np.nda
             "t_stat_HC3": float(ols_fit.tvalues[idx]),
             "p_val_HC3": float(ols_fit.pvalues[idx]),
         })
+    
+    neg_mask = ols_plain.fittedvalues < 0.0
+    ols_neg_count = int(np.sum(neg_mask))
+    ols_neg_pct = float(np.mean(neg_mask) * 100.0)
 
     df_ols = pd.DataFrame(ols_rows)
     df_ols["R2"] = float(ols_plain.rsquared)
@@ -256,6 +260,8 @@ def analyze_nonlinearity_and_ols(df_full: pd.DataFrame, X: np.ndarray, y: np.nda
     df_ols["Ramsey_RESET_p"] = float(reset_res.pvalue)
     df_ols["White_Heterosk_Stat"] = float(white_stat)
     df_ols["White_Heterosk_p"] = float(white_p)
+    df_ols["OLS_Neg_Pred_Count"] = ols_neg_count
+    df_ols["OLS_Neg_Pred_Pct"] = ols_neg_pct
     df_ols.to_csv(EDA_DIR / "eda_ols_diagnostics.csv", index=False)
 
     # News Impact Curve empírica por deciles de retorno de BTC y SPY
@@ -292,7 +298,7 @@ def plot_nonlinearity_justification(df_full: pd.DataFrame, df_nonlin: pd.DataFra
         rotation=45, ha="right", fontsize=8
     )
     ax1.set_ylabel(r"Varianza futura $r_{t+1}^2$ (%$^2$)")
-    ax1.set_title("A. News Impact Curve Empírica\n(Respuesta en 'V' Asimétrica / Apalancamiento)")
+    ax1.set_title("A. News Impact Curve Empírica\n(Respuesta Asimétrica / Efecto Apalancamiento)")
     ax1.legend(loc="upper center", frameon=True, fontsize=8.5)
 
     # Panel B: Correlación Lineal |Pearson| vs Información Mutua Normalizada
@@ -487,6 +493,8 @@ def run_full_eda(phase: str = "phase_a", top_n_outliers: int = 20):
     print("\n[2/3] DEPENDENCIA LINEAL (PEARSON) VS. NO LINEAL (SPEARMAN / INFORMACIÓN MUTUA) Y VIF:")
     disp_nonlin = ["Feature", "Pearson_r", "Pearson_AbsX_r", "Spearman_rho", "Mutual_Info_Target", "VIF"]
     print(df_nonlin[disp_nonlin].to_string(index=False))
+    print(f"  • Predicciones OLS negativas (in-sample): {int(df_ols['OLS_Neg_Pred_Count'].iloc[0])} "
+          f"({df_ols['OLS_Neg_Pred_Pct'].iloc[0]:.2f}% de las observaciones)")
 
     print("\n[2/3] DIAGNÓSTICO DE ESPECIFICACIÓN LINEAL MCO (OLS):")
     print(f"  • R² = {df_ols['R2'].iloc[0]:.4f} | R² Ajustado = {df_ols['R2_Adj'].iloc[0]:.4f}")
@@ -521,7 +529,7 @@ if __name__ == "__main__":
         type=str,
         default="phase_a",
         choices=["phase_a", "all"],
-        help="Usar 'phase_a' (<= 2025-12-25) para blindar Fase B, o 'all' para el período completo.",
+        help="Usar 'phase_a' (<= 2025-12-24) para blindar Fase B, o 'all' para el período completo.",
     )
     parser.add_argument("--top-outliers", type=int, default=20, help="Cantidad de eventos extremos a catalogar.")
     args = parser.parse_args()
